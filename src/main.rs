@@ -7,13 +7,20 @@
 //!
 //! Keys: Ctrl+Alt+T brings it down or puts it away, Ctrl+Alt+Shift+Q quits.
 //! The tray icon does the same two things with the mouse.
+//!
+//! Explorer can also hand pictures over: "挂到 Picline" in the right-click menu
+//! starts this exe with `--hang` and the selected paths. If a copy is already
+//! running, the paths are passed to it instead of starting a second one.
 
 #![windows_subsystem = "windows"]
 
 mod canvas;
 mod clipboard;
 mod gdiplus;
+mod shellmenu;
 
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use canvas::Canvas;
@@ -27,6 +34,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
@@ -70,6 +78,10 @@ const WM_TRAY: u32 = WM_APP + 1;
 const MENU_TOGGLE: usize = 1;
 const MENU_CLEAR: usize = 2;
 const MENU_QUIT: usize = 3;
+const MENU_SHELL: usize = 4;
+/// Marks the `WM_COPYDATA` payload as a list of paths, so the receiving copy
+/// knows what it was handed.
+const COPYDATA_PATHS: usize = 0x5049434C; // "PICL"
 
 fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -117,6 +129,8 @@ struct App {
     shots: Vec<Shot>,
     /// A clipboard change waiting for the app that wrote it to let go.
     clip_pending: Option<(Instant, u32)>,
+    /// Whether "挂到 Picline" is in Explorer's right-click menu right now.
+    shell_menu: bool,
     last_tick: Instant,
 }
 
@@ -137,6 +151,7 @@ impl App {
             peek_until: None,
             shots: Vec::new(),
             clip_pending: None,
+            shell_menu: false,
             last_tick: Instant::now(),
         }
     }
@@ -250,7 +265,7 @@ impl App {
             );
 
             if self.shots.is_empty() {
-                let hint = "截图或复制图片后，会挂到这里";
+                let hint = "截图、复制图片，或右键「挂到 Picline」";
                 let font = 12.0 * scale;
                 let capsule_w = hint.chars().count() as f32 * font + 26.0 * scale;
                 let capsule_h = font + 14.0 * scale;
@@ -425,6 +440,18 @@ impl App {
         self.update_tip();
     }
 
+    /// Adds or removes the Explorer item, and remembers which it is now.
+    fn toggle_shell_menu(&mut self) {
+        if self.shell_menu {
+            shellmenu::remove();
+        } else {
+            shellmenu::install();
+        }
+        self.shell_menu = shellmenu::installed();
+        shellmenu::remember(self.shell_menu);
+        clipboard::trace(&format!("Explorer item on: {}", self.shell_menu));
+    }
+
     fn update_tip(&self) {
         let mut data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -464,11 +491,7 @@ impl App {
                     arrived = true;
                 }
                 if arrived {
-                    while self.shots.len() > MAX_SHOTS {
-                        self.shots.remove(0);
-                    }
-                    self.update_tip();
-                    self.show_what_arrived();
+                    self.accepted();
                 }
             }
             None => {
@@ -481,6 +504,38 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Puts pictures from files on disk onto the line. This is the route
+    /// Explorer's "挂到 Picline" takes, and the same one a copied file takes;
+    /// both end up looking identical once they are cards.
+    fn add_files(&mut self, paths: &[PathBuf]) {
+        let mut arrived = false;
+        for path in paths {
+            match clipboard::shot_from_path(path) {
+                Some(shot) => {
+                    if self.shots.iter().any(|old| old.hash == shot.hash) {
+                        continue;
+                    }
+                    self.shots.push(shot);
+                    arrived = true;
+                }
+                None => clipboard::trace(&format!("could not read {}", path.display())),
+            }
+        }
+        if arrived {
+            self.accepted();
+        }
+    }
+
+    /// Shared tail end of anything that brings pictures in: cap the row,
+    /// refresh the tray text, and show the line for a moment.
+    fn accepted(&mut self) {
+        while self.shots.len() > MAX_SHOTS {
+            self.shots.remove(0);
+        }
+        self.update_tip();
+        self.show_what_arrived();
     }
 
     fn tick(&mut self) {
@@ -626,6 +681,13 @@ impl App {
         };
         let _ = AppendMenuW(menu, clear, MENU_CLEAR, w!("全部取下"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let shell = if self.shell_menu {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(menu, shell, MENU_SHELL, w!("资源管理器右键「挂到 Picline」"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -656,6 +718,66 @@ fn fullscreen_busy() -> bool {
     }
 }
 
+/// The picture files Explorer put on the command line. Anything that is not a
+/// file — the `--hang` flag, a `%1` the shell failed to expand — is logged and
+/// dropped, so a launch never hangs an empty card.
+fn hang_request() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        let path = PathBuf::from(&arg);
+        if path.is_file() {
+            paths.push(path);
+        } else if !arg.to_string_lossy().starts_with("--") {
+            clipboard::trace(&format!("not a file: {}", path.display()));
+        }
+    }
+    paths
+}
+
+/// Splits the double-NUL terminated list back into paths.
+fn paths_from_blob(text: &[u16]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut start = 0;
+    for (at, unit) in text.iter().enumerate() {
+        if *unit != 0 {
+            continue;
+        }
+        if at > start {
+            let name = std::ffi::OsString::from_wide(&text[start..at]);
+            paths.push(PathBuf::from(name));
+        }
+        start = at + 1;
+    }
+    paths
+}
+
+/// Hands the paths to the copy that is already running. Explorer runs the item
+/// as a fresh process every time; this is what makes the second, third and
+/// tenth picture land on the same line instead of starting a second rope.
+unsafe fn forward(paths: &[PathBuf]) {
+    let Ok(window) = FindWindowW(w!("PiclineLine"), w!("Picline")) else {
+        clipboard::trace("no running copy to hand the pictures to");
+        return;
+    };
+    let mut blob: Vec<u16> = Vec::new();
+    for path in paths {
+        blob.extend(path.as_os_str().encode_wide());
+        blob.push(0);
+    }
+    blob.push(0);
+    let data = COPYDATASTRUCT {
+        dwData: COPYDATA_PATHS,
+        cbData: blob.len() as u32 * 2,
+        lpData: blob.as_ptr() as *mut _,
+    };
+    SendMessageW(
+        window,
+        WM_COPYDATA,
+        WPARAM(window.0 as usize),
+        LPARAM(&data as *const COPYDATASTRUCT as isize),
+    );
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if !pointer.is_null() {
@@ -671,6 +793,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.clip_pending = Some((Instant::now(), 0));
                 return LRESULT(0);
             }
+            WM_COPYDATA => {
+                let copy = &*(lparam.0 as *const COPYDATASTRUCT);
+                if copy.dwData == COPYDATA_PATHS && !copy.lpData.is_null() && copy.cbData >= 2 {
+                    let units = copy.cbData as usize / 2;
+                    let blob = std::slice::from_raw_parts(copy.lpData as *const u16, units);
+                    let paths = paths_from_blob(blob);
+                    clipboard::trace(&format!("Explorer handed over {} picture(s)", paths.len()));
+                    app.add_files(&paths);
+                }
+                return LRESULT(1);
+            }
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE => app.toggle(),
@@ -685,6 +818,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 match wparam.0 & 0xFFFF {
                     MENU_TOGGLE => app.toggle(),
                     MENU_CLEAR => app.take_everything_down(),
+                    MENU_SHELL => app.toggle_shell_menu(),
                     MENU_QUIT => {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -715,8 +849,15 @@ fn main() {
         // Per monitor: the strip keeps the same thickness on a 150% screen.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+        let requested = hang_request();
+
         let _singleton = CreateMutexW(None, true, w!("Local\\PiclineForWindows"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Explorer starts a fresh process for every click. Pass the
+            // pictures to the copy that is already up and leave quietly.
+            if !requested.is_empty() {
+                forward(&requested);
+            }
             return;
         }
 
@@ -767,6 +908,19 @@ fn main() {
         let app = Box::into_raw(Box::new(App::new(hwnd)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).add_tray();
+
+        // Put "挂到 Picline" in Explorer's right-click menu. Rewritten on every
+        // start so it always points at wherever the exe lives now, and it stays
+        // gone once it has been switched off from the tray.
+        if shellmenu::wanted() {
+            shellmenu::install();
+            (*app).shell_menu = shellmenu::installed();
+        }
+        clipboard::trace(&format!("Explorer item on: {}", (*app).shell_menu));
+
+        if !requested.is_empty() {
+            (*app).add_files(&requested);
+        }
 
         clipboard::watch(hwnd.0 as isize);
 
