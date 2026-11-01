@@ -247,15 +247,23 @@ unsafe fn from_files(drop: isize, out: &mut Vec<Shot>) {
         }
         buffer.truncate(written as usize);
         let path: PathBuf = std::ffi::OsString::from_wide(&buffer).into();
-        if !is_picture(&path) {
-            continue;
-        }
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        wide.push(0);
-        if let Some(raw) = crate::gdiplus::image_from_file(&wide) {
-            out.push(Shot::new(raw.width, raw.height, raw.pixels));
+        if let Some(shot) = shot_from_path(&path) {
+            out.push(shot);
         }
     }
+}
+
+/// One picture from a file on disk. This is the same path a copied file and
+/// Explorer's "挂到 Picline" both take, so a picture looks the same whichever
+/// way it arrived.
+pub fn shot_from_path(path: &std::path::Path) -> Option<Shot> {
+    if !is_picture(path) {
+        return None;
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let raw = crate::gdiplus::image_from_file(&wide)?;
+    Some(Shot::new(raw.width, raw.height, raw.pixels))
 }
 
 fn is_picture(path: &std::path::Path) -> bool {
