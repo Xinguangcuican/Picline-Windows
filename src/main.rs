@@ -579,10 +579,11 @@ impl App {
             return;
         }
         self.catching = on;
+        let through = WS_EX_TRANSPARENT.0 as isize;
+        let next;
         unsafe {
             let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
-            let through = WS_EX_TRANSPARENT.0 as isize;
-            let next = if on { style & !through } else { style | through };
+            next = if on { style & !through } else { style | through };
             SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next);
             // The new style has to be pushed through for hit testing to see
             // it straight away.
@@ -600,6 +601,12 @@ impl App {
         // more so the strip never blinks out.
         if self.shown {
             self.slide();
+        }
+        // Worth a line in the log if the style did not take: then nothing on
+        // the line could ever be clicked.
+        let after = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) };
+        if (after & through) != (next & through) {
+            clipboard::trace(&format!("ex style did not take: {after} wanted {next}"));
         }
     }
 
