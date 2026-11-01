@@ -579,6 +579,12 @@ impl App {
     }
 
     fn set_hover(&mut self, hover: Option<usize>) {
+        // While a picture is being carried the strip must stay out of the way:
+        // taking the mouse back here would put the line between the picture
+        // and the window it is being dropped on.
+        if self.dragging {
+            return;
+        }
         if self.hover == hover {
             return;
         }
