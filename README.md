@@ -16,6 +16,7 @@ Mac 上那条「截图晾衣绳」的 Windows 版。
 | **卡片右键菜单** | 预览、复制图片、复制为文件、存到桌面、在资源管理器中显示、用默认看图程序打开、取下这张、取下左边全部、取下右边全部、全部取下 |
 | **复制图片** | 写 `CF_DIB`，在微信 / QQ 输入框里 `Ctrl + V` 直接发图 |
 | **复制为文件** | 写 `CF_HDROP`，粘到聊天窗口是文件消息，粘到资源管理器是拷一份 PNG |
+| **拖拽出卡片** | 按住卡片往任何地方拖：微信 / QQ 聊天窗口、桌面、任意文件夹、看图软件。拖到桌面或文件夹就是拷一份 PNG 过去（截图会给一个「Picline 2026-11-02 07-23-45.png」这样的名字；本来就有原文件的图，拖出去的是那个原文件） |
 | 全部取下 | 托盘右键 →「全部取下」，清空整条绳子 |
 | 右键挂图 | 在资源管理器里选中一张或多张图片，右键 →「挂到 Picline」，直接挂上绳。不需要先打开程序 |
 | 快捷键 | `Ctrl + Alt + T` 放下 / 收起；`Ctrl + Alt + Shift + Q` 退出 |
@@ -28,7 +29,6 @@ Mac 上那条「截图晾衣绳」的 Windows 版。
 
 | 还做不到 | 说明 |
 | --- | --- |
-| 拖拽出卡片 | OLE 拖放要在 `windows` 0.58 里手写 `IDataObject` 虚表，没有真机验证前不敢放上来。要发图请用右键「复制图片」或「复制为文件」 |
 | 中键 / 长按 | Mac 上的长按预览、中键标记，Windows 这边没做（预览改成了单击） |
 | 多桌面 | 虚拟桌面切换时窗口不会自己跟过去 |
 | 开机自启 | 要自己把 exe 的快捷方式放进启动目录 |
@@ -49,7 +49,7 @@ Windows 11 的「新式菜单」之所以进不去，是因为它只接受 MSIX 
 
 ## 怎么试
 
-1. 把 `Picline-0.1.3-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
+1. 把 `Picline-0.1.4-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
 2. 双击。首次运行会因为未签名被 SmartScreen 拦一下：点「更多信息 → 仍要运行」。
 3. 用微信截图、`Win + Shift + S`、或随手复制一张图片。
 4. 绳子应该自己下来，图片以卡片形式挂上去，1.6 秒后收回。
@@ -58,6 +58,7 @@ Windows 11 的「新式菜单」之所以进不去，是因为它只接受 MSIX 
 5.2 点卡片本体：全屏压暗，图片放大，底部写着文件名和尺寸；点任意位置收起。
 5.3 在卡片上右键：菜单里试「复制图片」，然后到微信输入框里 `Ctrl + V`。
 5.4 右键 →「存到桌面」，桌面上会多一张 `Picline 2026-11-02 07-23-45.png`。
+5.5 按住一张卡往微信输入框里拖，松手就是一张图；往桌面或某个文件夹里拖，松手就多一个 png。拖的时候绳子会让开鼠标，不会挡住落点。
 6. 在任意文件夹里右键一张图片 →「挂到 Picline」（Win11 要先点「显示更多选项」）。
 7. 右键托盘图标 →「全部取下」清空。
 
@@ -103,8 +104,8 @@ scripts/build-win.sh both      # 产物在 dist/
 
 | 文件 | 架构 | 大小 | PE |
 | --- | --- | --- | --- |
-| `dist/Picline-0.1.3-win-x64.exe` | x86_64 | 337 KB | PE32+ / Windows GUI |
-| `dist/Picline-0.1.3-win-arm64.exe` | ARM64 | 272 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.4-win-x64.exe` | x86_64 | 342 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.4-win-arm64.exe` | ARM64 | 276 KB | PE32+ / Windows GUI |
 
 ## 代码结构
 
@@ -113,6 +114,7 @@ scripts/build-win.sh both      # 产物在 dist/
 | `src/main.rs` | 窗口、消息循环、贴顶状态机、动画、卡片排版、悬停与命中测试、卡片右键菜单、托盘、热键、命令行 `--hang`、单实例转发 |
 | `src/clipboard.rs` | 剪贴板监听与四种格式解析（HDROP / DIBV5 / DIB / BITMAP / PNG），写回剪贴板（DIB / HDROP），存 PNG 到桌面，收图去重，日志 |
 | `src/preview.rs` | 全屏预览窗：压暗桌面、等比放大、文件名与尺寸、点一下收起 |
+| `src/drag.rs` | 手写的 OLE 拖放：`IDataObject`（只给 `CF_HDROP`）、`IEnumFORMATETC`、`IDropSource` 三张虚表，`DoDragDrop` |
 | `src/shellmenu.rs` | 注册表里的「挂到 Picline」动词：装、卸、查 |
 | `src/canvas.rs` | 32 位 DIB + `UpdateLayeredWindow`，逐像素透明 |
 | `src/gdiplus.rs` | 手写 GDI+ 绑定：曲线、圆角、文字、图片解码、缩放、PNG 编码 |
@@ -130,6 +132,8 @@ GDI+ 的绑定是手写的（没用 `windows` crate 的 GdiPlus 模块），这�
 - `WM_COPYDATA` 那条路径的打包／拆包单独抽出来跑过：空列表、单个 ASCII 路径、三个带空格与中文的路径、以及尾部少一个 NUL 的残包，都能原样往返。
 - 二进制里核对过写进注册表的字符串（键路径、菜单文字、`MultiSelectModel`、`--hang %* "%1"`）和导入表（多了 `advapi32.dll`，没有额外的运行时 DLL）。
 
-0.1.3 加的这些交互**没有真机跑过**，只做过类型与链接层的验证，另外靠 `picline.log` 留了痕迹：右键、点叉、开预览、菜单选项都会各写一行，出问题时把那几行发回来就能定位。
+0.1.4 这些交互**没有在真机上跑过**（本机是 Mac，只做交叉编译）。能验证的都验证了：虚表顺序对着 `windows` crate 的定义逐项核对，`FORMATETC` / `STGMEDIUM` / `GUID` 的尺寸用编译期断言钉住（32 / 24 / 16 字节），`DROPFILES` 的字段偏移按 SDK 布局写（路径列表从第 20 字节起，`fWide = 1`）。真正的 OLE 往返只能靠那台 Windows。
+
+`picline.log` 里会留下痕迹：按下拖拽（`drag of shot N: <路径>`）、拖拽结束（`drag finished: hr … effect …`）、右键、点叉、开预览、菜单选项各写一行。出问题时把最后几十行发回来就能定位。
 
 没做的是：真机运行。所以第一次跑还是要靠那台 Windows。
