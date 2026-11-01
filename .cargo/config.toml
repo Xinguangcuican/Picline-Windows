@@ -1,0 +1,18 @@
+# Cross-compiling from a Mac: llvm-mingw supplies the linker and the Windows
+# import libraries. The .cfg patch shipped by rustc already knows the two
+# *-windows-gnu targets, so pointing `linker` at its clang wrapper is enough.
+[target.x86_64-pc-windows-gnu]
+linker = "/Users/xinguangcuican/toolchains/llvm-mingw-20261020-ucrt-macos-universal/bin/x86_64-w64-mingw32-clang"
+rustflags = ["-C", "link-arg=-Wl,--subsystem,windows"]
+
+[target.aarch64-pc-windows-gnu]
+linker = "/Users/xinguangcuican/toolchains/llvm-mingw-20261020-ucrt-macos-universal/bin/aarch64-w64-mingw32-clang"
+rustflags = ["-C", "link-arg=-Wl,--subsystem,windows"]
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "/Users/xinguangcuican/toolchains/bin/x64-gnullvm-cc"
+rustflags = ["-C", "link-arg=-Wl,--subsystem,windows", "-C", "link-arg=-static", "-C", "link-arg=-L/Users/xinguangcuican/toolchains/static-unwind/x64"]
+
+[target.aarch64-pc-windows-gnullvm]
+linker = "/Users/xinguangcuican/toolchains/bin/arm64-gnullvm-cc"
+rustflags = ["-C", "link-arg=-Wl,--subsystem,windows", "-C", "link-arg=-static", "-C", "link-arg=-L/Users/xinguangcuican/toolchains/static-unwind/arm64"]
