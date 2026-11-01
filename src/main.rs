@@ -17,6 +17,7 @@
 mod canvas;
 mod clipboard;
 mod gdiplus;
+mod preview;
 mod shellmenu;
 
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -41,13 +42,15 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-
 /// How close to the top counts as touching it.
 const BAND: i32 = 3;
 /// Resting this long against the edge brings the line down. Long enough that a
@@ -79,6 +82,18 @@ const MENU_TOGGLE: usize = 1;
 const MENU_CLEAR: usize = 2;
 const MENU_QUIT: usize = 3;
 const MENU_SHELL: usize = 4;
+/// The per card menu. Numbers start well above the tray's so the two can
+/// never be confused.
+const CARD_PREVIEW: usize = 101;
+const CARD_COPY: usize = 102;
+const CARD_COPY_FILE: usize = 103;
+const CARD_SAVE: usize = 104;
+const CARD_OPEN: usize = 105;
+const CARD_REVEAL: usize = 106;
+const CARD_TAKE: usize = 111;
+const CARD_LEFT: usize = 112;
+const CARD_RIGHT: usize = 113;
+const CARD_ALL: usize = 114;
 /// Marks the `WM_COPYDATA` payload as a list of paths, so the receiving copy
 /// knows what it was handed.
 const COPYDATA_PATHS: usize = 0x5049434C; // "PICL"
@@ -94,6 +109,13 @@ struct Card {
     w: f32,
     h: f32,
     shot: usize,
+}
+
+/// What the pointer is over: a card, or the cross that takes it down.
+#[derive(Clone, Copy)]
+struct Hit {
+    shot: usize,
+    close: bool,
 }
 
 /// Largest rectangle with that shape that fits in the box.
@@ -132,6 +154,28 @@ struct App {
     /// Whether "挂到 Picline" is in Explorer's right-click menu right now.
     shell_menu: bool,
     last_tick: Instant,
+    /// Where the strip was last put, so pointer positions can be turned into
+    /// card positions.
+    origin: (i32, i32),
+    /// The cards as they were last drawn.
+    cards: Vec<Card>,
+    /// The card the pointer is over, by shot index.
+    hover: Option<usize>,
+    /// Whether the strip is currently catching the mouse. It only does so
+    /// while a card is under the pointer, so the rope never eats a click meant
+    /// for a maximised window's buttons.
+    catching: bool,
+    /// A card menu is open: no fading away underneath it.
+    menu_open: bool,
+    /// The big preview is up.
+    preview_open: bool,
+    /// Which card the open menu belongs to.
+    menu_target: Option<usize>,
+    /// A plain window used only to own popup menus; a window that refuses
+    /// activation cannot dismiss its own menu.
+    menu_owner: HWND,
+    /// The left button went down on a card and has not come up yet.
+    pressed: bool,
 }
 
 impl App {
@@ -153,6 +197,15 @@ impl App {
             clip_pending: None,
             shell_menu: false,
             last_tick: Instant::now(),
+            origin: (0, 0),
+            cards: Vec::new(),
+            hover: None,
+            catching: false,
+            menu_open: false,
+            preview_open: false,
+            menu_target: None,
+            menu_owner: HWND::default(),
+            pressed: false,
         }
     }
 
@@ -230,6 +283,7 @@ impl App {
     }
 
     fn paint(&mut self) {
+        let mut laid_out: Vec<Card> = Vec::new();
         {
             let Some(canvas) = self.canvas.as_ref() else { return };
             canvas.clear();
@@ -359,9 +413,59 @@ impl App {
                         2.0 * scale,
                         argb(200, 196, 198, 202),
                     );
+
+                    // Under the pointer: an accent edge and the cross that
+                    // takes the picture down, the same way out as on the Mac.
+                    if self.hover == Some(card.shot) {
+                        painter.rounded_outline(
+                            card.x,
+                            card.y,
+                            card.w,
+                            card.h,
+                            radius,
+                            2.0 * scale,
+                            argb(220, 74, 144, 255),
+                        );
+                        let r = 9.5 * scale;
+                        let cross_x = card.x + card.w - 12.0 * scale;
+                        let cross_y = card.y + 12.0 * scale;
+                        painter.rounded(
+                            cross_x - r,
+                            cross_y - r,
+                            r * 2.0,
+                            r * 2.0,
+                            r,
+                            argb(238, 26, 26, 28),
+                        );
+                        painter.rounded_outline(
+                            cross_x - r,
+                            cross_y - r,
+                            r * 2.0,
+                            r * 2.0,
+                            r,
+                            1.0 * scale,
+                            argb(90, 255, 255, 255),
+                        );
+                        let arm = 3.6 * scale;
+                        let ink = argb(240, 245, 245, 245);
+                        painter.line(
+                            (cross_x - arm, cross_y - arm),
+                            (cross_x + arm, cross_y + arm),
+                            1.6 * scale,
+                            ink,
+                        );
+                        painter.line(
+                            (cross_x - arm, cross_y + arm),
+                            (cross_x + arm, cross_y - arm),
+                            1.6 * scale,
+                            ink,
+                        );
+                    }
                 }
+                laid_out = cards;
             }
         }
+        self.cards = laid_out;
         self.painted = true;
     }
 
@@ -391,11 +495,333 @@ impl App {
             self.shown = true;
         }
         canvas.present(self.monitor.left, y);
+        self.origin = (self.monitor.left, y);
+    }
+
+    /// Paints the strip again right now. Anything that changes what is on it
+    /// has to call this: while the line is resting, nothing else asks for a
+    /// new frame.
+    fn refresh(&mut self) {
+        self.painted = false;
+        if self.shown {
+            self.paint();
+            self.slide();
+        }
     }
 
     fn retract_to_zero(&mut self) {
         self.target = 0.0;
         self.pinned = false;
+    }
+
+    // --- the pointer ------------------------------------------------------
+
+    /// Pointer position in strip coordinates, or nothing when there is no
+    /// strip drawn to point at.
+    fn pointer(&self) -> Option<(f32, f32)> {
+        if self.cards.is_empty() {
+            return None;
+        }
+        let mut point = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut point);
+        }
+        Some((
+            (point.x - self.origin.0) as f32,
+            (point.y - self.origin.1) as f32,
+        ))
+    }
+
+    fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
+        let reach = 11.0 * self.scale;
+        for card in self.cards.iter().rev() {
+            // The cross is only live on the card the pointer is already on, so
+            // it never takes a click from a neighbour.
+            if self.hover == Some(card.shot) {
+                let cross_x = card.x + card.w - 12.0 * self.scale;
+                let cross_y = card.y + 12.0 * self.scale;
+                if (x - cross_x).abs() <= reach && (y - cross_y).abs() <= reach {
+                    return Some(Hit {
+                        shot: card.shot,
+                        close: true,
+                    });
+                }
+            }
+            if x >= card.x && x <= card.x + card.w && y >= card.y && y <= card.y + card.h {
+                return Some(Hit {
+                    shot: card.shot,
+                    close: false,
+                });
+            }
+        }
+        None
+    }
+
+    fn current_hit(&self) -> Option<Hit> {
+        let (x, y) = self.pointer()?;
+        self.hit_at(x, y)
+    }
+
+    fn set_hover(&mut self, hover: Option<usize>) {
+        if self.hover == hover {
+            return;
+        }
+        self.hover = hover;
+        self.refresh();
+        self.set_catching(hover.is_some());
+    }
+
+    /// A strip that is always in the way would be a nuisance: it only catches
+    /// the mouse while one of its cards is under the pointer. Everything else
+    /// goes through to whatever is behind it.
+    fn set_catching(&mut self, on: bool) {
+        if self.catching == on {
+            return;
+        }
+        self.catching = on;
+        unsafe {
+            let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let through = WS_EX_TRANSPARENT.0 as isize;
+            let next = if on { style & !through } else { style | through };
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next);
+            // The new style has to be pushed through for hit testing to see
+            // it straight away.
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        // A style change can make the layered surface stale; hand it over once
+        // more so the strip never blinks out.
+        if self.shown {
+            self.slide();
+        }
+    }
+
+    // --- what a card can do -----------------------------------------------
+
+    fn preview(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        let opened = preview::open(self.hwnd, shot, self.monitor);
+        clipboard::trace(&format!("preview of shot {index}: {opened}"));
+        if opened {
+            self.preview_open = true;
+        }
+    }
+
+    fn preview_closed(&mut self) {
+        self.preview_open = false;
+        if self.shown {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+
+    fn copy_image(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        let done = clipboard::put_image(shot);
+        clipboard::trace(&format!("copy picture: {done}"));
+    }
+
+    fn copy_file(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        if let Some(path) = clipboard::ensure_file(shot) {
+            clipboard::put_files(&[path]);
+        }
+    }
+
+    fn save_copy(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        match clipboard::save_to_desktop(shot) {
+            Some(path) => clipboard::trace(&format!("saved a copy: {}", path.display())),
+            None => clipboard::trace("could not save a copy"),
+        }
+    }
+
+    fn open_with_viewer(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        let Some(path) = clipboard::ensure_file(shot) else {
+            return;
+        };
+        let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+
+    fn reveal(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        let Some(path) = clipboard::ensure_file(shot) else {
+            return;
+        };
+        let mut arguments: Vec<u16> = format!("/select,\"{}\"", path.display())
+            .encode_utf16()
+            .collect();
+        arguments.push(0);
+        unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("explorer.exe"),
+                PCWSTR(arguments.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+
+    fn forget(&mut self, index: usize) {
+        if index >= self.shots.len() {
+            return;
+        }
+        self.shots.remove(index);
+        self.hover = None;
+        self.update_tip();
+        if self.shots.is_empty() {
+            self.peek_until = None;
+            self.retract_to_zero();
+        }
+        self.refresh();
+    }
+
+    /// Takes down everything on one side of a card, leaving the card itself.
+    fn drop_side(&mut self, index: usize, to_the_left: bool) {
+        if to_the_left {
+            if index == 0 {
+                return;
+            }
+            self.shots.drain(0..index);
+        } else {
+            self.shots.truncate(index + 1);
+        }
+        self.hover = None;
+        self.update_tip();
+        self.refresh();
+    }
+
+    // --- menus ------------------------------------------------------------
+
+    /// Runs a popup menu and returns the item picked, or 0. A window that
+    /// refuses activation cannot dismiss its own menu, so the menu is owned by
+    /// a plain hidden window, and focus goes back where it was afterwards.
+    unsafe fn run_menu(&self, menu: HMENU) -> u32 {
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let previous = GetForegroundWindow();
+        let _ = SetForegroundWindow(self.menu_owner);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            point.x,
+            point.y,
+            0,
+            self.menu_owner,
+            None,
+        );
+        if !previous.is_invalid() {
+            let _ = SetForegroundWindow(previous);
+        }
+        let _ = PostMessageW(self.menu_owner, WM_NULL, WPARAM(0), LPARAM(0));
+        picked.0 as u32
+    }
+
+    fn card_menu(&mut self, hit: Hit) {
+        let Some(shot) = self.shots.get(hit.shot) else {
+            return;
+        };
+        let has_file = shot.path.is_some();
+        let left = hit.shot > 0;
+        let right = hit.shot + 1 < self.shots.len();
+
+        let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+            return;
+        };
+        let flag = |on: bool| {
+            if on {
+                MF_STRING
+            } else {
+                MF_STRING | MF_GRAYED
+            }
+        };
+        unsafe {
+            let _ = AppendMenuW(menu, MF_STRING, CARD_PREVIEW, w!("预览"));
+            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY, w!("复制图片"));
+            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY_FILE, w!("复制为文件"));
+            let _ = AppendMenuW(menu, MF_STRING, CARD_SAVE, w!("存到桌面"));
+            let _ = AppendMenuW(menu, flag(has_file), CARD_REVEAL, w!("在资源管理器中显示"));
+            let _ = AppendMenuW(menu, MF_STRING, CARD_OPEN, w!("用默认看图程序打开"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CARD_TAKE, w!("取下这张"));
+            let _ = AppendMenuW(menu, flag(left), CARD_LEFT, w!("取下左边全部"));
+            let _ = AppendMenuW(menu, flag(right), CARD_RIGHT, w!("取下右边全部"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CARD_ALL, w!("全部取下"));
+        }
+
+        self.menu_target = Some(hit.shot);
+        self.menu_open = true;
+        let picked = unsafe { self.run_menu(menu) };
+        self.menu_open = false;
+        unsafe {
+            let _ = DestroyMenu(menu);
+        }
+        clipboard::trace(&format!("menu picked {picked}"));
+        if picked != 0 {
+            self.card_command(picked as usize);
+        }
+        self.menu_target = None;
+    }
+
+    fn card_command(&mut self, command: usize) {
+        let Some(index) = self.menu_target else {
+            return;
+        };
+        match command {
+            CARD_PREVIEW => self.preview(index),
+            CARD_COPY => self.copy_image(index),
+            CARD_COPY_FILE => self.copy_file(index),
+            CARD_SAVE => self.save_copy(index),
+            CARD_REVEAL => self.reveal(index),
+            CARD_OPEN => self.open_with_viewer(index),
+            CARD_TAKE => self.forget(index),
+            CARD_LEFT => self.drop_side(index, true),
+            CARD_RIGHT => self.drop_side(index, false),
+            CARD_ALL => self.take_everything_down(),
+            _ => {}
+        }
     }
 
     fn monitor_under_pointer() -> RECT {
@@ -436,6 +862,8 @@ impl App {
         self.shots.clear();
         self.painted = false;
         self.peek_until = None;
+        self.hover = None;
+        self.set_catching(false);
         self.retract_to_zero();
         self.update_tip();
     }
@@ -545,6 +973,11 @@ impl App {
 
         self.check_clipboard(now);
 
+        // A menu or a preview is up: the line holds still underneath it.
+        if self.menu_open || self.preview_open {
+            return;
+        }
+
         let mut cursor = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut cursor);
@@ -629,7 +1062,15 @@ impl App {
             // for a strip nobody is looking at. The pictures stay.
             self.canvas = None;
             self.painted = false;
+            self.cards.clear();
+            self.hover = None;
+            self.set_catching(false);
         }
+
+        // Whatever the pointer is over decides whether the strip catches the
+        // mouse at all, and which card shows its cross.
+        let hit = if self.shown { self.current_hit() } else { None };
+        self.set_hover(hit.map(|h| h.shot));
     }
 
     fn toggle(&mut self) {
@@ -671,7 +1112,7 @@ impl App {
         let _ = Shell_NotifyIconW(NIM_DELETE, &data);
     }
 
-    unsafe fn tray_menu(&self) {
+    unsafe fn tray_menu(&mut self) {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, w!("放下来 / 收起来"));
         let clear = if self.shots.is_empty() {
@@ -689,28 +1130,64 @@ impl App {
         let _ = AppendMenuW(menu, shell, MENU_SHELL, w!("资源管理器右键「挂到 Picline」"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
-        let mut point = POINT::default();
-        let _ = GetCursorPos(&mut point);
-        let _ = SetForegroundWindow(self.hwnd);
-        let _ = TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-            point.x,
-            point.y,
-            0,
-            self.hwnd,
-            None,
-        );
+        let picked = self.run_menu(menu);
         let _ = DestroyMenu(menu);
-        // Windows keeps the menu on screen until something else happens; a
-        // posted null message is the documented nudge.
-        let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        match picked as usize {
+            MENU_TOGGLE => self.toggle(),
+            MENU_CLEAR => self.take_everything_down(),
+            MENU_SHELL => self.toggle_shell_menu(),
+            MENU_QUIT => {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The default window procedure, as a plain function so it can be handed to
+/// `WNDCLASSW` without the generics of the crate's wrapper.
+unsafe extern "system" fn plain_window(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// An invisible, ordinary window that exists only to own popup menus. The
+/// strip itself is `WS_EX_NOACTIVATE`, and a window that refuses activation
+/// cannot dismiss its own menu when you click elsewhere.
+fn menu_owner(instance: HINSTANCE) -> HWND {
+    let class = w!("PiclineMenu");
+    let definition = WNDCLASSW {
+        lpfnWndProc: Some(plain_window),
+        hInstance: instance,
+        lpszClassName: class,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = RegisterClassW(&definition);
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class,
+            w!("Picline menu"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
+        )
+        .unwrap_or_default()
     }
 }
 
 /// A full screen app, or presentation mode: leave that screen alone.
-fn fullscreen_busy() -> bool {
-    unsafe {
+fn fullscreen_busy() -> bool {    unsafe {
         match SHQueryUserNotificationState() {
             Ok(state) => matches!(state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN),
             Err(_) => false,
@@ -791,6 +1268,67 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Noting it now and reading it a moment later avoids the
                 // classic race with the app that has just locked the board.
                 app.clip_pending = Some((Instant::now(), 0));
+                return LRESULT(0);
+            }
+            WM_MOUSEACTIVATE => {
+                // Clicking a picture must not take the keyboard away from
+                // whatever you were typing in.
+                return LRESULT(MA_NOACTIVATE as isize);
+            }
+            WM_MOUSEMOVE => {
+                // Only arrives while a card is under the pointer; keeps the
+                // highlight in step without waiting for the timer.
+                let hit = app.current_hit();
+                app.set_hover(hit.map(|h| h.shot));
+                return LRESULT(0);
+            }
+            WM_SETCURSOR => {
+                let hand = app.current_hit().map(|h| h.close).unwrap_or(false);
+                unsafe {
+                    let shape = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }).unwrap_or_default();
+                    let _ = SetCursor(shape);
+                }
+                return LRESULT(1);
+            }
+            WM_LBUTTONDOWN => {
+                match app.current_hit() {
+                    Some(hit) if hit.close => {
+                        clipboard::trace(&format!("cross clicked on shot {}", hit.shot));
+                        app.forget(hit.shot)
+                    }
+                    Some(_) => {
+                        app.pressed = true;
+                        unsafe {
+                            SetCapture(hwnd);
+                        }
+                    }
+                    None => {}
+                }
+                return LRESULT(0);
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if app.pressed {
+                    app.pressed = false;
+                    if let Some(hit) = app.current_hit() {
+                        if !hit.close {
+                            app.preview(hit.shot);
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
+            WM_RBUTTONUP => {
+                if let Some(hit) = app.current_hit() {
+                    clipboard::trace(&format!("menu asked for shot {}", hit.shot));
+                    app.card_menu(hit);
+                }
+                return LRESULT(0);
+            }
+            preview::CLOSED => {
+                app.preview_closed();
                 return LRESULT(0);
             }
             WM_COPYDATA => {
@@ -907,6 +1445,7 @@ fn main() {
 
         let app = Box::into_raw(Box::new(App::new(hwnd)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+        (*app).menu_owner = menu_owner(HINSTANCE(instance.0));
         (*app).add_tray();
 
         // Put "挂到 Picline" in Explorer's right-click menu. Rewritten on every

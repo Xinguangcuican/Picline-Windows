@@ -4,6 +4,7 @@
 //! the crate's GdiPlus bindings, which come and go between releases.
 
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use windows::Win32::Graphics::Gdi::HDC;
 
 #[repr(C)]
@@ -141,6 +142,12 @@ extern "system" {
         data: *mut BitmapData,
     ) -> i32;
     fn GdipBitmapUnlockBits(image: *mut c_void, data: *mut BitmapData) -> i32;
+    fn GdipSaveImageToFile(
+        image: *mut c_void,
+        filename: *const u16,
+        clsid: *const windows::core::GUID,
+        params: *const c_void,
+    ) -> i32;
 }
 
 #[link(name = "shlwapi")]
@@ -443,6 +450,40 @@ pub fn image_from_file(path: &[u16]) -> Option<Raw> {
         raw
     }
 }
+
+/// Writes the buffer out as a PNG. Used for saving a copy and for the
+/// temporary file that a plain screenshot needs before it can be pasted into a
+/// chat as a file.
+pub fn save_png(pixels: &[u8], width: u32, height: u32, path: &std::path::Path) -> bool {
+    if width == 0 || height == 0 || pixels.len() < (width * height * 4) as usize {
+        return false;
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut bitmap: *mut c_void = std::ptr::null_mut();
+        if GdipCreateBitmapFromScan0(
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            FORMAT_ARGB32,
+            pixels.as_ptr() as *mut u8,
+            &mut bitmap,
+        ) != 0
+        {
+            return false;
+        }
+        let status = GdipSaveImageToFile(bitmap, wide.as_ptr(), &PNG_ENCODER, std::ptr::null());
+        let _ = GdipDisposeImage(bitmap);
+        status == 0
+    }
+}
+
+/// `image/png`, the encoder GDI+ carries on every Windows since XP.
+const PNG_ENCODER: windows::core::GUID = windows::core::GUID::from_u128(0x557C_F406_1A04_11D3_9A73_0000F81E_F32E);
 
 /// Brings a picture down to a size worth keeping in memory.
 pub fn shrink(width: u32, height: u32, pixels: &[u8]) -> Option<Raw> {

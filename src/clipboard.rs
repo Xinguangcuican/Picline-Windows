@@ -20,6 +20,8 @@ const CF_DIBV5: u32 = 17;
 extern "system" {
     fn OpenClipboard(owner: isize) -> i32;
     fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn SetClipboardData(format: u32, mem: isize) -> isize;
     fn GetClipboardData(format: u32) -> isize;
     fn IsClipboardFormatAvailable(format: u32) -> i32;
     fn RegisterClipboardFormatW(name: *const u16) -> u32;
@@ -40,7 +42,12 @@ extern "system" {
     fn GlobalLock(handle: isize) -> *mut c_void;
     fn GlobalUnlock(handle: isize) -> i32;
     fn GlobalSize(handle: isize) -> usize;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
+    fn GlobalFree(handle: isize) -> isize;
 }
+
+const GMEM_MOVEABLE: u32 = 0x0002;
+const GMEM_ZEROINIT: u32 = 0x0040;
 
 #[link(name = "shell32")]
 extern "system" {
@@ -105,6 +112,9 @@ pub struct Shot {
     /// BGRA, top row first, `width * height * 4` bytes.
     pub pixels: Vec<u8>,
     pub hash: u64,
+    /// Where it came from, when it came from a file rather than the clipboard.
+    /// The caption in the preview and "show in Explorer" both need it.
+    pub path: Option<PathBuf>,
 }
 
 impl Shot {
@@ -115,11 +125,24 @@ impl Shot {
             height,
             pixels,
             hash,
+            path: None,
         }
     }
 
     pub fn aspect(&self) -> f32 {
         self.width as f32 / self.height as f32
+    }
+
+    /// The line under a preview: what it is and how big it is.
+    pub fn caption(&self) -> String {
+        let name = match &self.path {
+            Some(path) => path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "图片".to_string()),
+            None => "截图 / 复制的图片".to_string(),
+        };
+        format!("{name} · {} × {}", self.width, self.height)
     }
 }
 
@@ -263,7 +286,9 @@ pub fn shot_from_path(path: &std::path::Path) -> Option<Shot> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
     let raw = crate::gdiplus::image_from_file(&wide)?;
-    Some(Shot::new(raw.width, raw.height, raw.pixels))
+    let mut shot = Shot::new(raw.width, raw.height, raw.pixels);
+    shot.path = Some(path.to_path_buf());
+    Some(shot)
 }
 
 fn is_picture(path: &std::path::Path) -> bool {
@@ -448,6 +473,183 @@ fn fingerprint(pixels: &[u8]) -> u64 {
     }
     hash ^= pixels.len() as u64;
     hash
+}
+
+// --- giving pictures back -------------------------------------------------
+
+/// Puts the picture on the clipboard as a `CF_DIB`, which is what WeChat, QQ
+/// and Paint read when you press Ctrl+V. Rows are bottom up here, as the
+/// format expects, so the memory can be handed over untouched.
+pub fn put_image(shot: &Shot) -> bool {
+    let row = shot.width as usize * 4;
+    let total = 40 + row * shot.height as usize;
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
+        let mut done = false;
+        if mem != 0 {
+            let base = GlobalLock(mem) as *mut u8;
+            if base.is_null() {
+                let _ = GlobalFree(mem);
+            } else {
+                write_u32(base, 0, 40); // biSize
+                write_u32(base, 4, shot.width); // biWidth
+                write_u32(base, 8, shot.height); // biHeight, bottom up
+                write_u16(base, 12, 1); // biPlanes
+                write_u16(base, 14, 32); // biBitCount
+                write_u32(base, 16, 0); // BI_RGB
+                write_u32(base, 20, (row * shot.height as usize) as u32);
+                for y in 0..shot.height as usize {
+                    let from = shot.height as usize - 1 - y;
+                    let source = shot.pixels.as_ptr().add(from * row);
+                    std::ptr::copy_nonoverlapping(source, base.add(40 + y * row), row);
+                }
+                let _ = GlobalUnlock(mem);
+                // On success the clipboard owns the block; freeing it would
+                // leave the data dangling.
+                done = SetClipboardData(CF_DIB, mem) != 0;
+                if !done {
+                    let _ = GlobalFree(mem);
+                }
+            }
+        }
+        CloseClipboard();
+        trace(&format!("copied picture to clipboard: {done}"));
+        done
+    }
+}
+
+/// Puts files on the clipboard, so a picture can be pasted into a chat as a
+/// file, or straight into Explorer.
+pub fn put_files(paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    // DROPFILES: header, then a double terminated list of UTF-16 paths.
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.as_os_str().encode_wide());
+        names.push(0);
+    }
+    names.push(0);
+    let header = 20usize;
+    let total = header + names.len() * 2;
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return false;
+        }
+        let _ = EmptyClipboard();
+        let mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
+        let mut done = false;
+        if mem != 0 {
+            let base = GlobalLock(mem) as *mut u8;
+            if base.is_null() {
+                let _ = GlobalFree(mem);
+            } else {
+                write_u32(base, 0, header as u32); // pFiles
+                write_u32(base, 16, 1); // fWide
+                std::ptr::copy_nonoverlapping(
+                    names.as_ptr() as *const u8,
+                    base.add(header),
+                    names.len() * 2,
+                );
+                let _ = GlobalUnlock(mem);
+                done = SetClipboardData(CF_HDROP, mem) != 0;
+                if !done {
+                    let _ = GlobalFree(mem);
+                }
+            }
+        }
+        CloseClipboard();
+        trace(&format!("copied {} file(s) to clipboard: {done}", paths.len()));
+        done
+    }
+}
+
+unsafe fn write_u32(base: *mut u8, at: usize, value: u32) {
+    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), base.add(at), 4);
+}
+
+unsafe fn write_u16(base: *mut u8, at: usize, value: u16) {
+    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), base.add(at), 2);
+}
+
+/// A file on disk for a picture that only exists in memory. Screenshots have
+/// no file of their own; anything that needs one — pasting as a file, saving,
+/// showing in Explorer — gets this instead.
+pub fn ensure_file(shot: &Shot) -> Option<PathBuf> {
+    if let Some(path) = &shot.path {
+        if path.is_file() {
+            return Some(path.clone());
+        }
+    }
+    let folder = std::env::temp_dir().join("Picline");
+    std::fs::create_dir_all(&folder).ok()?;
+    let path = folder.join(format!("picline-{:016x}.png", shot.hash));
+    if path.is_file() {
+        return Some(path);
+    }
+    if crate::gdiplus::save_png(&shot.pixels, shot.width, shot.height, &path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Saves a copy on the Desktop, named the way a screenshot tool would.
+pub fn save_to_desktop(shot: &Shot) -> Option<PathBuf> {
+    let desktop = desktop_dir()?;
+    let stamp = timestamp();
+    let path = desktop.join(format!("Picline {stamp}.png"));
+    if crate::gdiplus::save_png(&shot.pixels, shot.width, shot.height, &path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn desktop_dir() -> Option<PathBuf> {
+    let base = std::env::var("USERPROFILE").ok()?;
+    let path = PathBuf::from(base).join("Desktop");
+    if path.is_dir() {
+        return Some(path);
+    }
+    // A Desktop redirected into OneDrive is common enough to be worth a look.
+    let alt = PathBuf::from(std::env::var("OneDrive").ok()?).join("Desktop");
+    if alt.is_dir() {
+        Some(alt)
+    } else {
+        None
+    }
+}
+
+/// `2026-11-02 07-23-45`, from the system clock, in local time.
+fn timestamp() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(out: *mut SystemTime);
+    }
+    let mut now = SystemTime::default();
+    unsafe { GetLocalTime(&mut now) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}-{:02}-{:02}",
+        now.year, now.month, now.day, now.hour, now.minute, now.second
+    )
 }
 
 // --- the log --------------------------------------------------------------
