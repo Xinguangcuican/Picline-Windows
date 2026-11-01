@@ -599,6 +599,31 @@ pub fn ensure_file(shot: &Shot) -> Option<PathBuf> {
     }
 }
 
+/// A file to hand to another program when a card is dragged out. A picture
+/// that came from a file is offered as that very file; anything else is
+/// written out with a name a person would recognise in a chat window.
+pub fn ensure_drag_file(shot: &Shot) -> Option<PathBuf> {
+    if let Some(path) = &shot.path {
+        if path.is_file() {
+            return Some(path.clone());
+        }
+    }
+    let folder = std::env::temp_dir().join("Picline").join("drag");
+    std::fs::create_dir_all(&folder).ok()?;
+    let base = format!("Picline {}", timestamp());
+    let mut path = folder.join(format!("{base}.png"));
+    let mut count = 2;
+    while path.is_file() {
+        path = folder.join(format!("{base} ({count}).png"));
+        count += 1;
+    }
+    if crate::gdiplus::save_png(&shot.pixels, shot.width, shot.height, &path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Saves a copy on the Desktop, named the way a screenshot tool would.
 pub fn save_to_desktop(shot: &Shot) -> Option<PathBuf> {
     let desktop = desktop_dir()?;

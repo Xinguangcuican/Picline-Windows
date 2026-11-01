@@ -11,11 +11,16 @@
 //! Explorer can also hand pictures over: "挂到 Picline" in the right-click menu
 //! starts this exe with `--hang` and the selected paths. If a copy is already
 //! running, the paths are passed to it instead of starting a second one.
+//!
+//! A card can be clicked (preview), right-clicked (menu), or dragged out: the
+//! picture is offered to Windows as a file, so it can be dropped into a chat
+//! window, the desktop, or any folder.
 
 #![windows_subsystem = "windows"]
 
 mod canvas;
 mod clipboard;
+mod drag;
 mod gdiplus;
 mod preview;
 mod shellmenu;
@@ -176,6 +181,14 @@ struct App {
     menu_owner: HWND,
     /// The left button went down on a card and has not come up yet.
     pressed: bool,
+    /// Where that press happened, in screen pixels, so a small movement can be
+    /// told from the start of a drag.
+    press_from: Option<POINT>,
+    /// The card under that press.
+    press_shot: Option<usize>,
+    /// A drag is running: the strip holds still and lets the mouse through
+    /// while the picture is carried somewhere else.
+    dragging: bool,
 }
 
 impl App {
@@ -206,6 +219,9 @@ impl App {
             menu_target: None,
             menu_owner: HWND::default(),
             pressed: false,
+            press_from: None,
+            press_shot: None,
+            dragging: false,
         }
     }
 
@@ -569,6 +585,49 @@ impl App {
         self.hover = hover;
         self.refresh();
         self.set_catching(hover.is_some());
+    }
+
+    /// Turns a press that has moved far enough into a drag of that card. The
+    /// strip gives the mouse back first, so the picture can be dropped on
+    /// whatever is behind the line instead of on the line itself.
+    fn maybe_drag(&mut self) {
+        let (Some(index), Some(from)) = (self.press_shot, self.press_from) else {
+            return;
+        };
+        let mut now = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut now);
+        }
+        let slop = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(4);
+        if (now.x - from.x).abs() < slop && (now.y - from.y).abs() < slop {
+            return;
+        }
+
+        self.pressed = false;
+        self.press_shot = None;
+        self.press_from = None;
+        self.hover = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        // Click-through while carrying: the line must not sit between the
+        // picture and the window it is being dropped into.
+        self.set_catching(false);
+        self.refresh();
+
+        let Some(path) = self.shots.get(index).and_then(clipboard::ensure_drag_file) else {
+            clipboard::trace("drag: no file for that picture");
+            return;
+        };
+
+        clipboard::trace(&format!("drag of shot {index}: {}", path.display()));
+        self.dragging = true;
+        let note = drag::carry(&path);
+        self.dragging = false;
+        clipboard::trace(&format!("drag finished: {note}"));
+
+        self.set_hover(None);
+        self.refresh();
     }
 
     /// A strip that is always in the way would be a nuisance: it only catches
@@ -980,8 +1039,9 @@ impl App {
 
         self.check_clipboard(now);
 
-        // A menu or a preview is up: the line holds still underneath it.
-        if self.menu_open || self.preview_open {
+        // A menu, a preview or a drag is in progress: the line holds still
+        // underneath it.
+        if self.menu_open || self.preview_open || self.dragging {
             return;
         }
 
@@ -1285,15 +1345,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_MOUSEMOVE => {
                 // Only arrives while a card is under the pointer; keeps the
                 // highlight in step without waiting for the timer.
+                if app.pressed {
+                    app.maybe_drag();
+                }
                 let hit = app.current_hit();
                 app.set_hover(hit.map(|h| h.shot));
                 return LRESULT(0);
             }
             WM_SETCURSOR => {
-                let hand = app.current_hit().map(|h| h.close).unwrap_or(false);
+                // A hand over the cross, the four arrows over the picture: it
+                // can be carried anywhere a file can be dropped.
+                let shape = match app.current_hit() {
+                    Some(hit) if hit.close => IDC_HAND,
+                    Some(_) => IDC_SIZEALL,
+                    None => IDC_ARROW,
+                };
                 unsafe {
-                    let shape = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }).unwrap_or_default();
-                    let _ = SetCursor(shape);
+                    let cursor = LoadCursorW(None, shape).unwrap_or_default();
+                    let _ = SetCursor(cursor);
                 }
                 return LRESULT(1);
             }
@@ -1303,8 +1372,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         clipboard::trace(&format!("cross clicked on shot {}", hit.shot));
                         app.forget(hit.shot)
                     }
-                    Some(_) => {
+                    Some(hit) => {
                         app.pressed = true;
+                        app.press_shot = Some(hit.shot);
+                        let mut from = POINT::default();
+                        unsafe {
+                            let _ = GetCursorPos(&mut from);
+                        }
+                        app.press_from = Some(from);
                         unsafe {
                             SetCapture(hwnd);
                         }
@@ -1319,6 +1394,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if app.pressed {
                     app.pressed = false;
+                    app.press_shot = None;
+                    app.press_from = None;
                     if let Some(hit) = app.current_hit() {
                         if !hit.close {
                             app.preview(hit.shot);
@@ -1393,6 +1470,8 @@ fn main() {
     unsafe {
         // Per monitor: the strip keeps the same thickness on a 150% screen.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // OLE, for dragging pictures out of the line.
+        drag::prepare();
 
         let requested = hang_request();
 
