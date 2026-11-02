@@ -22,6 +22,7 @@ mod canvas;
 mod clipboard;
 mod drag;
 mod gdiplus;
+mod hotkey;
 mod settings;
 mod preview;
 mod shellmenu;
@@ -93,6 +94,7 @@ const MENU_REVEAL_NONE: usize = 10;
 const MENU_REVEAL_CTRL: usize = 11;
 const MENU_REVEAL_ALT: usize = 12;
 const MENU_REVEAL_SHIFT: usize = 13;
+const MENU_HOTKEY: usize = 5;
 /// The per card menu. Numbers start well above the tray's so the two can
 /// never be confused.
 const CARD_PREVIEW: usize = 101;
@@ -1427,6 +1429,20 @@ impl App {
         self.set_hover(hit.map(|h| h.shot));
     }
 
+    /// The recorder has finished. Apply what it chose; if the system refuses
+    /// the combination because something else holds it, put the previous one
+    /// back and say so instead of leaving the app without a shortcut.
+    fn set_hotkey(&mut self, want: Option<hotkey::HotKey>) {
+        let previous = hotkey::load();
+        if hotkey::apply(self.hwnd, want) {
+            let text = want.map(|key| key.label()).unwrap_or_else(|| "none".to_string());
+            clipboard::trace(&format!("hotkey: {text}"));
+        } else {
+            hotkey::apply(self.hwnd, previous);
+            hotkey::complain(self.hwnd);
+        }
+    }
+
     fn toggle(&mut self) {
         if self.target > 0.0 {
             self.peek_until = None;
@@ -1499,6 +1515,13 @@ impl App {
         };
         let _ = AppendMenuW(menu, shell, MENU_SHELL, w!("资源管理器右键「挂到 Picline」"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let shortcut = match hotkey::load() {
+            Some(key) => format!("快捷键：{}…", key.label()),
+            None => "快捷键：未设置…".to_string(),
+        };
+        let shortcut_label = wide(&shortcut);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_HOTKEY, PCWSTR(shortcut_label.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
         let picked = self.run_menu(menu);
         let _ = DestroyMenu(menu);
@@ -1512,6 +1535,7 @@ impl App {
             MENU_TOGGLE => self.toggle(),
             MENU_CLEAR => self.take_everything_down(),
             MENU_SHELL => self.toggle_shell_menu(),
+            MENU_HOTKEY => hotkey::record(self.hwnd),
             MENU_QUIT => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -1753,6 +1777,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 return LRESULT(1);
             }
+            hotkey::CHANGED => {
+                match wparam.0 {
+                    hotkey::RESULT_PICKED => app.set_hotkey(Some(hotkey::picked())),
+                    hotkey::RESULT_CLEARED => app.set_hotkey(None),
+                    _ => clipboard::trace("hotkey recording cancelled"),
+                }
+                return LRESULT(0);
+            }
             WM_HOTKEY => {
                 match wparam.0 as i32 {
                     HOTKEY_TOGGLE => app.toggle(),
@@ -1773,6 +1805,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     MENU_TOGGLE => app.toggle(),
                     MENU_CLEAR => app.take_everything_down(),
                     MENU_SHELL => app.toggle_shell_menu(),
+                    MENU_HOTKEY => hotkey::record(hwnd),
                     MENU_QUIT => {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -1883,7 +1916,13 @@ fn main() {
 
         clipboard::watch(hwnd.0 as isize);
 
-        let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, 0x54);
+        // The toggle combination is the user's to choose; the quit one is not,
+        // because it is the way out when something has gone wrong.
+        let want = hotkey::load();
+        if !hotkey::apply(hwnd, want) {
+            clipboard::trace("hotkey refused at startup, falling back to the default");
+            hotkey::apply(hwnd, Some(hotkey::HotKey::DEFAULT));
+        }
         let _ = RegisterHotKey(hwnd, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0x51);
         SetTimer(hwnd, TIMER_TICK, 16, None);
 
