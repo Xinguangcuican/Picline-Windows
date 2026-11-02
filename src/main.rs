@@ -22,6 +22,7 @@ mod canvas;
 mod clipboard;
 mod drag;
 mod gdiplus;
+mod settings;
 mod preview;
 mod shellmenu;
 
@@ -49,7 +50,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
-    VK_CONTROL, VK_SHIFT,
+    VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -88,6 +89,10 @@ const MENU_TOGGLE: usize = 1;
 const MENU_CLEAR: usize = 2;
 const MENU_QUIT: usize = 3;
 const MENU_SHELL: usize = 4;
+const MENU_REVEAL_NONE: usize = 10;
+const MENU_REVEAL_CTRL: usize = 11;
+const MENU_REVEAL_ALT: usize = 12;
+const MENU_REVEAL_SHIFT: usize = 13;
 /// The per card menu. Numbers start well above the tray's so the two can
 /// never be confused.
 const CARD_PREVIEW: usize = 101;
@@ -106,6 +111,87 @@ const COPYDATA_PATHS: usize = 0x5049434C; // "PICL"
 
 fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// A key held while the pointer rests against the top edge. `None` keeps the
+/// old behaviour: the pointer alone brings the line down.
+#[derive(Clone, Copy, PartialEq)]
+enum RevealKey {
+    None,
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+impl RevealKey {
+    const ALL: [RevealKey; 4] = [RevealKey::None, RevealKey::Ctrl, RevealKey::Alt, RevealKey::Shift];
+
+    fn code(self) -> &'static str {
+        match self {
+            RevealKey::None => "none",
+            RevealKey::Ctrl => "ctrl",
+            RevealKey::Alt => "alt",
+            RevealKey::Shift => "shift",
+        }
+    }
+
+    fn from_code(text: &str) -> RevealKey {
+        match text {
+            "ctrl" => RevealKey::Ctrl,
+            "alt" => RevealKey::Alt,
+            "shift" => RevealKey::Shift,
+            _ => RevealKey::None,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            RevealKey::None => "不需要按键",
+            RevealKey::Ctrl => "按住 Ctrl",
+            RevealKey::Alt => "按住 Alt",
+            RevealKey::Shift => "按住 Shift",
+        }
+    }
+
+    fn menu_id(self) -> usize {
+        match self {
+            RevealKey::None => MENU_REVEAL_NONE,
+            RevealKey::Ctrl => MENU_REVEAL_CTRL,
+            RevealKey::Alt => MENU_REVEAL_ALT,
+            RevealKey::Shift => MENU_REVEAL_SHIFT,
+        }
+    }
+
+    fn from_menu(id: usize) -> Option<RevealKey> {
+        match id {
+            MENU_REVEAL_NONE => Some(RevealKey::None),
+            MENU_REVEAL_CTRL => Some(RevealKey::Ctrl),
+            MENU_REVEAL_ALT => Some(RevealKey::Alt),
+            MENU_REVEAL_SHIFT => Some(RevealKey::Shift),
+            _ => None,
+        }
+    }
+
+    /// Held right now, read straight from the keyboard state.
+    fn held(self) -> bool {
+        let key = match self {
+            RevealKey::None => return true,
+            RevealKey::Ctrl => VK_CONTROL,
+            RevealKey::Alt => VK_MENU,
+            RevealKey::Shift => VK_SHIFT,
+        };
+        unsafe { GetKeyState(key.0 as i32) < 0 }
+    }
+
+    fn load() -> RevealKey {
+        settings::get("revealKey")
+            .map(|text| RevealKey::from_code(&text))
+            .unwrap_or(RevealKey::None)
+    }
+
+    fn save(self) {
+        settings::set("revealKey", self.code());
+    }
 }
 
 /// One card on the line, in logical pixels of the strip.
@@ -159,6 +245,8 @@ struct App {
     clip_pending: Option<(Instant, u32)>,
     /// Whether "挂到 Picline" is in Explorer's right-click menu right now.
     shell_menu: bool,
+    /// What has to be held for the pointer against the top edge to count.
+    reveal_key: RevealKey,
     last_tick: Instant,
     /// Where the strip was last put, so pointer positions can be turned into
     /// card positions.
@@ -218,6 +306,7 @@ impl App {
             shots: Vec::new(),
             clip_pending: None,
             shell_menu: false,
+            reveal_key: RevealKey::load(),
             last_tick: Instant::now(),
             origin: (0, 0),
             cards: Vec::new(),
@@ -1269,7 +1358,7 @@ impl App {
         // Coming down: rest against the top edge long enough, and not while a
         // full screen app owns that screen.
         if self.target < 1.0 {
-            if against_edge && !fullscreen_busy() {
+            if against_edge && !fullscreen_busy() && self.reveal_key.held() {
                 let since = *self.hot_since.get_or_insert(now);
                 if now.duration_since(since) >= REVEAL_DELAY {
                     self.hot_since = None;
@@ -1380,6 +1469,22 @@ impl App {
     unsafe fn tray_menu(&mut self) {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, w!("放下来 / 收起来"));
+        // What has to be held for the pointer against the top edge to count.
+        // A submenu of four radio items rather than a checkbox list, so the
+        // tray stays the height it was.
+        if let Ok(reveal) = CreatePopupMenu() {
+            for key in RevealKey::ALL {
+                let state = if self.reveal_key == key {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let text = wide(key.title());
+                let _ = AppendMenuW(reveal, state, key.menu_id(), PCWSTR(text.as_ptr()));
+            }
+            let label = wide("贴顶唤出");
+            let _ = AppendMenuW(menu, MF_POPUP, reveal.0 as usize, PCWSTR(label.as_ptr()));
+        }
         let clear = if self.shots.is_empty() {
             MF_STRING | MF_GRAYED
         } else {
@@ -1397,6 +1502,12 @@ impl App {
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
         let picked = self.run_menu(menu);
         let _ = DestroyMenu(menu);
+        if let Some(key) = RevealKey::from_menu(picked as usize) {
+            self.reveal_key = key;
+            key.save();
+            clipboard::trace(&format!("reveal key: {}", key.code()));
+            return;
+        }
         match picked as usize {
             MENU_TOGGLE => self.toggle(),
             MENU_CLEAR => self.take_everything_down(),
@@ -1449,6 +1560,11 @@ fn menu_owner(instance: HINSTANCE) -> HWND {
         )
         .unwrap_or_default()
     }
+}
+
+/// A NUL-terminated UTF-16 copy, for the Win32 calls that take a pointer.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// A full screen app, or presentation mode: leave that screen alone.
@@ -1648,6 +1764,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             WM_COMMAND => {
+                if let Some(key) = RevealKey::from_menu(wparam.0 & 0xFFFF) {
+                    app.reveal_key = key;
+                    key.save();
+                    return LRESULT(0);
+                }
                 match wparam.0 & 0xFFFF {
                     MENU_TOGGLE => app.toggle(),
                     MENU_CLEAR => app.take_everything_down(),
