@@ -13,7 +13,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::PathBuf;
 
 type Hresult = i32;
 
@@ -578,12 +578,19 @@ unsafe extern "system" fn source_give_feedback(_this: *mut c_void, _effect: u32)
 /// Runs the drag and blocks until the button comes up. The result is written
 /// as `hr / effect` for the log, so a drop that lands nowhere can be told from
 /// one that never started.
-pub fn carry(path: &Path) -> String {
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if !wide.contains(&0) {
-        wide.push(0);
+///
+/// Every path goes into one list, which is how Windows carries a handful of
+/// files at once: the target gets all of them, not just the one under the
+/// pointer.
+pub fn carry(paths: &[PathBuf]) -> String {
+    let mut wide: Vec<u16> = Vec::new();
+    for path in paths {
+        wide.extend(path.as_os_str().encode_wide());
         wide.push(0);
     }
+    // The list itself ends with an empty string, so a path list is always
+    // followed by a second null.
+    wide.push(0);
 
     let data = Box::into_raw(Box::new(Data {
         vtbl: &DATA_VTBL,
