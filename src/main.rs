@@ -1001,12 +1001,14 @@ impl App {
             return;
         };
         let has_file = shot.path.is_some();
-        let left = hit.shot > 0;
-        let right = hit.shot + 1 < self.shots.len();
         // Everything in the menu acts on what is picked out: three cards
         // picked and one of them right-clicked means three of everything.
         let group = self.targets(hit.shot);
         let picked = group.len();
+        // "Everything to the left" only means something for one card: with
+        // three picked out there is no single place to measure from.
+        let left = picked == 1 && hit.shot > 0;
+        let right = picked == 1 && hit.shot + 1 < self.shots.len();
 
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
             return;
@@ -1031,7 +1033,7 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, CARD_PREVIEW, w!("预览"));
             // A clipboard holds one bitmap, so this one stays on the card that
             // was right-clicked; files and the drag carry the whole group.
-            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY, w!("复制图片（这张）"));
+            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY, w!("复制图片"));
             let label = name("复制为文件");
             let _ = AppendMenuW(menu, MF_STRING, CARD_COPY_FILE, PCWSTR(label.as_ptr()));
             let label = name("存到桌面");
