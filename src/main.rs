@@ -673,9 +673,10 @@ impl App {
         }
     }
 
-    /// What a drag that starts on this card carries: the whole group when this
-    /// card is part of it, otherwise just this one.
-    fn drag_payload(&self, index: usize) -> Vec<usize> {
+    /// What a drag or a menu command acts on: the whole group when this card
+    /// is part of it, otherwise just this one. A plain click leaves exactly one
+    /// card picked, so "this one" needs no special case.
+    fn targets(&self, index: usize) -> Vec<usize> {
         if self.selected.len() > 1 && self.is_selected(index) {
             self.shots
                 .iter()
@@ -739,7 +740,7 @@ impl App {
         }
 
         // Worked out before anything moves: the group is what is picked out.
-        let indices = self.drag_payload(index);
+        let indices = self.targets(index);
         self.pending_collapse = None;
         self.pressed = false;
         self.press_shot = None;
@@ -852,42 +853,58 @@ impl App {
         clipboard::trace(&format!("copy picture: {done}"));
     }
 
+    /// Every picked picture, in one file list: that is how Windows carries a
+    /// handful of files on the clipboard, and how a chat window sends several.
     fn copy_file(&mut self, index: usize) {
-        let Some(shot) = self.shots.get(index) else {
-            return;
-        };
-        if let Some(path) = clipboard::ensure_file(shot) {
-            clipboard::put_files(&[path]);
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for at in self.targets(index) {
+            match self.shots.get(at).and_then(clipboard::ensure_file) {
+                Some(path) => paths.push(path),
+                None => clipboard::trace(&format!("copy as file: nothing for shot {at}")),
+            }
         }
+        if paths.is_empty() {
+            clipboard::trace("copy as file: nothing to copy");
+            return;
+        }
+        clipboard::trace(&format!("copy as file: {} picture(s)", paths.len()));
+        clipboard::put_files(&paths);
     }
 
     fn save_copy(&mut self, index: usize) {
-        let Some(shot) = self.shots.get(index) else {
-            return;
-        };
-        match clipboard::save_to_desktop(shot) {
-            Some(path) => clipboard::trace(&format!("saved a copy: {}", path.display())),
-            None => clipboard::trace("could not save a copy"),
+        let group = self.targets(index);
+        let mut saved = 0;
+        for at in &group {
+            match self.shots.get(*at).and_then(clipboard::save_to_desktop) {
+                Some(path) => {
+                    saved += 1;
+                    clipboard::trace(&format!("saved a copy: {}", path.display()));
+                }
+                None => clipboard::trace("could not save a copy"),
+            }
         }
+        clipboard::trace(&format!("saved {saved} of {} picture(s)", group.len()));
     }
 
     fn open_with_viewer(&mut self, index: usize) {
-        let Some(shot) = self.shots.get(index) else {
-            return;
-        };
-        let Some(path) = clipboard::ensure_file(shot) else {
-            return;
-        };
-        let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(file.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            );
+        // The whole group opens; the viewer decides whether that means one
+        // window per picture or one window with several.
+        for at in self.targets(index) {
+            let Some(path) = self.shots.get(at).and_then(clipboard::ensure_file) else {
+                continue;
+            };
+            let file: Vec<u16> =
+                path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            unsafe {
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    PCWSTR(file.as_ptr()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                );
+            }
         }
     }
 
@@ -926,6 +943,16 @@ impl App {
             self.retract_to_zero();
         }
         self.refresh();
+    }
+
+    /// The menu's "取下这张": the whole picked group when the card is part of
+    /// it. Taken from the right first, so the indices to the left stay valid.
+    fn forget_group(&mut self, index: usize) {
+        let mut group = self.targets(index);
+        group.sort_unstable();
+        for at in group.into_iter().rev() {
+            self.forget(at);
+        }
     }
 
     /// Takes down everything on one side of a card, leaving the card itself.
@@ -976,6 +1003,10 @@ impl App {
         let has_file = shot.path.is_some();
         let left = hit.shot > 0;
         let right = hit.shot + 1 < self.shots.len();
+        // Everything in the menu acts on what is picked out: three cards
+        // picked and one of them right-clicked means three of everything.
+        let group = self.targets(hit.shot);
+        let picked = group.len();
 
         let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
             return;
@@ -987,15 +1018,35 @@ impl App {
                 MF_STRING | MF_GRAYED
             }
         };
+        // "存到桌面（3 张）" while a group is picked out, plain otherwise.
+        let name = |base: &str| -> Vec<u16> {
+            let text = if picked > 1 {
+                format!("{base}（{picked} 张）")
+            } else {
+                base.to_string()
+            };
+            text.encode_utf16().chain(std::iter::once(0)).collect()
+        };
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, CARD_PREVIEW, w!("预览"));
-            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY, w!("复制图片"));
-            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY_FILE, w!("复制为文件"));
-            let _ = AppendMenuW(menu, MF_STRING, CARD_SAVE, w!("存到桌面"));
-            let _ = AppendMenuW(menu, flag(has_file), CARD_REVEAL, w!("在资源管理器中显示"));
-            let _ = AppendMenuW(menu, MF_STRING, CARD_OPEN, w!("用默认看图程序打开"));
+            // A clipboard holds one bitmap, so this one stays on the card that
+            // was right-clicked; files and the drag carry the whole group.
+            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY, w!("复制图片（这张）"));
+            let label = name("复制为文件");
+            let _ = AppendMenuW(menu, MF_STRING, CARD_COPY_FILE, PCWSTR(label.as_ptr()));
+            let label = name("存到桌面");
+            let _ = AppendMenuW(menu, MF_STRING, CARD_SAVE, PCWSTR(label.as_ptr()));
+            let _ = AppendMenuW(
+                menu,
+                flag(has_file),
+                CARD_REVEAL,
+                w!("在资源管理器中显示"),
+            );
+            let label = name("用默认看图程序打开");
+            let _ = AppendMenuW(menu, MF_STRING, CARD_OPEN, PCWSTR(label.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, CARD_TAKE, w!("取下这张"));
+            let label = name("取下这张");
+            let _ = AppendMenuW(menu, MF_STRING, CARD_TAKE, PCWSTR(label.as_ptr()));
             let _ = AppendMenuW(menu, flag(left), CARD_LEFT, w!("取下左边全部"));
             let _ = AppendMenuW(menu, flag(right), CARD_RIGHT, w!("取下右边全部"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1027,7 +1078,7 @@ impl App {
             CARD_SAVE => self.save_copy(index),
             CARD_REVEAL => self.reveal(index),
             CARD_OPEN => self.open_with_viewer(index),
-            CARD_TAKE => self.forget(index),
+            CARD_TAKE => self.forget_group(index),
             CARD_LEFT => self.drop_side(index, true),
             CARD_RIGHT => self.drop_side(index, false),
             CARD_ALL => self.take_everything_down(),

@@ -627,8 +627,16 @@ pub fn ensure_drag_file(shot: &Shot) -> Option<PathBuf> {
 /// Saves a copy on the Desktop, named the way a screenshot tool would.
 pub fn save_to_desktop(shot: &Shot) -> Option<PathBuf> {
     let desktop = desktop_dir()?;
-    let stamp = timestamp();
-    let path = desktop.join(format!("Picline {stamp}.png"));
+    // Several pictures saved in the same second share a stamp, so the name has
+    // to be walked until nothing is in the way; otherwise the last one would
+    // quietly overwrite the others.
+    let base = format!("Picline {}", timestamp());
+    let mut path = desktop.join(format!("{base}.png"));
+    let mut count = 2;
+    while path.is_file() {
+        path = desktop.join(format!("{base} ({count}).png"));
+        count += 1;
+    }
     if crate::gdiplus::save_png(&shot.pixels, shot.width, shot.height, &path) {
         Some(path)
     } else {
