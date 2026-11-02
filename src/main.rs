@@ -48,7 +48,8 @@ use windows::Win32::UI::HiDpi::{
     MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -186,6 +187,14 @@ struct App {
     press_from: Option<POINT>,
     /// The card under that press.
     press_shot: Option<usize>,
+    /// Which cards are picked out, by picture fingerprint: one click picks one,
+    /// shift takes the run from the last one picked, Ctrl adds or removes one.
+    selected: Vec<u64>,
+    /// Where a shift click measures from.
+    anchor: Option<u64>,
+    /// A press inside a group, held back until the button comes up so that a
+    /// drag which follows can still carry the whole group.
+    pending_collapse: Option<u64>,
     /// A drag is running: the strip holds still and lets the mouse through
     /// while the picture is carried somewhere else.
     dragging: bool,
@@ -221,6 +230,9 @@ impl App {
             pressed: false,
             press_from: None,
             press_shot: None,
+            selected: Vec::new(),
+            anchor: None,
+            pending_collapse: None,
             dragging: false,
         }
     }
@@ -430,6 +442,20 @@ impl App {
                         argb(200, 196, 198, 202),
                     );
 
+                    // Picked out: a ring just outside the card, so the picture
+                    // itself is never covered.
+                    if self.is_selected(card.shot) {
+                        painter.rounded_outline(
+                            card.x - 2.0 * scale,
+                            card.y - 2.0 * scale,
+                            card.w + 4.0 * scale,
+                            card.h + 4.0 * scale,
+                            radius + 2.0 * scale,
+                            2.0 * scale,
+                            argb(235, 74, 144, 255),
+                        );
+                    }
+
                     // Under the pointer: an accent edge and the cross that
                     // takes the picture down, the same way out as on the Mac.
                     if self.hover == Some(card.shot) {
@@ -518,6 +544,7 @@ impl App {
     /// has to call this: while the line is resting, nothing else asks for a
     /// new frame.
     fn refresh(&mut self) {
+        self.prune_selection();
         self.painted = false;
         if self.shown {
             self.paint();
@@ -578,6 +605,108 @@ impl App {
         self.hit_at(x, y)
     }
 
+    // --- picking several out ----------------------------------------------
+
+    fn is_selected(&self, index: usize) -> bool {
+        self.shots
+            .get(index)
+            .map(|shot| self.selected.contains(&shot.hash))
+            .unwrap_or(false)
+    }
+
+    fn index_of(&self, hash: u64) -> Option<usize> {
+        self.shots.iter().position(|shot| shot.hash == hash)
+    }
+
+    /// The button went down on a card. Shift takes the run from the anchor of
+    /// the last pick, Ctrl adds or removes this one, a plain press picks this
+    /// one out — unless it is already part of a group, which stays as it is
+    /// until the button comes up, so a drag can carry all of it.
+    fn press_card(&mut self, index: usize, shift: bool, ctrl: bool) {
+        let Some(shot) = self.shots.get(index) else { return };
+        let hash = shot.hash;
+
+        if shift {
+            self.pending_collapse = None;
+            if let Some(anchor) = self.anchor.and_then(|a| self.index_of(a)) {
+                let (from, to) = if anchor <= index {
+                    (anchor, index)
+                } else {
+                    (index, anchor)
+                };
+                self.selected = self.shots[from..=to].iter().map(|shot| shot.hash).collect();
+            } else {
+                self.selected = vec![hash];
+                self.anchor = Some(hash);
+            }
+        } else if ctrl {
+            self.pending_collapse = None;
+            if let Some(at) = self.selected.iter().position(|&picked| picked == hash) {
+                self.selected.remove(at);
+            } else {
+                self.selected.push(hash);
+            }
+            self.anchor = Some(hash);
+        } else if self.selected.len() > 1 && self.selected.contains(&hash) {
+            self.pending_collapse = Some(hash);
+        } else {
+            self.pending_collapse = None;
+            self.selected = vec![hash];
+            self.anchor = Some(hash);
+        }
+        self.refresh();
+    }
+
+    /// The button came up. Without a drag, a press inside a group closes the
+    /// group down to that one card, the way Explorer does it.
+    fn settle_selection(&mut self, dragged: bool) {
+        let Some(pending) = self.pending_collapse.take() else {
+            return;
+        };
+        if dragged {
+            return;
+        }
+        if self.index_of(pending).is_some() {
+            self.selected = vec![pending];
+            self.anchor = Some(pending);
+            self.refresh();
+        }
+    }
+
+    /// What a drag that starts on this card carries: the whole group when this
+    /// card is part of it, otherwise just this one.
+    fn drag_payload(&self, index: usize) -> Vec<usize> {
+        if self.selected.len() > 1 && self.is_selected(index) {
+            self.shots
+                .iter()
+                .enumerate()
+                .filter(|(_, shot)| self.selected.contains(&shot.hash))
+                .map(|(at, _)| at)
+                .collect()
+        } else {
+            vec![index]
+        }
+    }
+
+    /// Cards that went away leave the selection with them.
+    fn prune_selection(&mut self) {
+        if self.selected.is_empty() && self.anchor.is_none() {
+            return;
+        }
+        let live: Vec<u64> = self.shots.iter().map(|shot| shot.hash).collect();
+        self.selected.retain(|hash| live.contains(hash));
+        if self.anchor.map(|a| !live.contains(&a)).unwrap_or(false) {
+            self.anchor = None;
+        }
+        if self
+            .pending_collapse
+            .map(|p| !live.contains(&p))
+            .unwrap_or(false)
+        {
+            self.pending_collapse = None;
+        }
+    }
+
     fn set_hover(&mut self, hover: Option<usize>) {
         // While a picture is being carried the strip must stay out of the way:
         // taking the mouse back here would put the line between the picture
@@ -609,6 +738,9 @@ impl App {
             return;
         }
 
+        // Worked out before anything moves: the group is what is picked out.
+        let indices = self.drag_payload(index);
+        self.pending_collapse = None;
         self.pressed = false;
         self.press_shot = None;
         self.press_from = None;
@@ -621,14 +753,21 @@ impl App {
         self.set_catching(false);
         self.refresh();
 
-        let Some(path) = self.shots.get(index).and_then(clipboard::ensure_drag_file) else {
-            clipboard::trace("drag: no file for that picture");
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for at in &indices {
+            match self.shots.get(*at).and_then(clipboard::ensure_drag_file) {
+                Some(path) => paths.push(path),
+                None => clipboard::trace(&format!("drag: no file for shot {at}")),
+            }
+        }
+        if paths.is_empty() {
+            clipboard::trace("drag: nothing to carry");
             return;
-        };
+        }
 
-        clipboard::trace(&format!("drag of shot {index}: {}", path.display()));
+        clipboard::trace(&format!("drag of {} picture(s): {:?}", paths.len(), paths));
         self.dragging = true;
-        let note = drag::carry(&path);
+        let note = drag::carry(&paths);
         self.dragging = false;
         clipboard::trace(&format!("drag finished: {note}"));
 
@@ -1379,6 +1518,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         app.forget(hit.shot)
                     }
                     Some(hit) => {
+                        // Picking happens on the way down, so a drag that
+                        // follows already knows what it is carrying.
+                        app.press_card(
+                            hit.shot,
+                            unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 },
+                            unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 },
+                        );
                         app.pressed = true;
                         app.press_shot = Some(hit.shot);
                         let mut from = POINT::default();
@@ -1402,10 +1548,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.pressed = false;
                     app.press_shot = None;
                     app.press_from = None;
-                    if let Some(hit) = app.current_hit() {
-                        if !hit.close {
-                            app.preview(hit.shot);
-                        }
+                    // Letting go only settles the pick; the picture opens on a
+                    // double click, as it does on the Mac.
+                    app.settle_selection(false);
+                }
+                return LRESULT(0);
+            }
+            WM_LBUTTONDBLCLK => {
+                if let Some(hit) = app.current_hit() {
+                    if !hit.close {
+                        app.preview(hit.shot);
                     }
                 }
                 return LRESULT(0);
@@ -1498,7 +1650,9 @@ fn main() {
         let instance = GetModuleHandleW(None).unwrap_or_default();
         let class = w!("PiclineLine");
         let window_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            // Double clicks: a card opens on one, and Windows only sends
+            // `WM_LBUTTONDBLCLK` to a class that asks for them.
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
