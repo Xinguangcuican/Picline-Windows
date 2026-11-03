@@ -285,10 +285,24 @@ pub fn shot_from_path(path: &std::path::Path) -> Option<Shot> {
     }
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
-    let raw = crate::gdiplus::image_from_file(&wide)?;
+    // GDI+ first: it is what every format it knows has always gone through.
+    // WIC after it, for the ones GDI+ has never heard of — WebP, HEIC — using
+    // whichever codecs this machine happens to have.
+    let raw = crate::gdiplus::image_from_file(&wide).or_else(|| crate::wic::decode(path))?;
     let mut shot = Shot::new(raw.width, raw.height, raw.pixels);
     shot.path = Some(path.to_path_buf());
     Some(shot)
+}
+
+/// When the file was last written, in nanoseconds. Used to notice that an
+/// editor has saved over a picture that is hanging on the line.
+pub fn modified(path: &std::path::Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_nanos())
+        .unwrap_or(0)
 }
 
 fn is_picture(path: &std::path::Path) -> bool {
@@ -298,7 +312,8 @@ fn is_picture(path: &std::path::Path) -> bool {
         .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
-        Some("png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff") => true,
+        Some("png" | "jpg" | "jpeg" | "jfif" | "bmp" | "gif" | "tif" | "tiff" | "ico" | "webp"
+        | "heic" | "heif" | "avif") => true,
         _ => false,
     }
 }

@@ -24,6 +24,9 @@ mod drag;
 mod gdiplus;
 mod hotkey;
 mod settings;
+mod startup;
+mod update;
+mod wic;
 mod preview;
 mod shellmenu;
 
@@ -66,6 +69,9 @@ const ICON_APP: u16 = 1;
 const ICON_TRAY_ON_DARK: u16 = 2;
 /// Dark strokes, for a light taskbar.
 const ICON_TRAY_ON_LIGHT: u16 = 3;
+/// The same two, faded, for when nothing is hanging.
+const ICON_TRAY_EMPTY_ON_DARK: u16 = 4;
+const ICON_TRAY_EMPTY_ON_LIGHT: u16 = 5;
 
 /// One icon out of the exe, at the size Windows asks for.
 fn load_icon(instance: HINSTANCE, id: u16, small: bool) -> Option<HICON> {
@@ -121,9 +127,16 @@ unsafe fn wide_equals(text: PCWSTR, expected: &str) -> bool {
     text.as_wide() == wanted.as_slice()
 }
 
-/// The tray icon in one colour, matching whatever the taskbar is.
-fn tray_icon(instance: HINSTANCE) -> HICON {
-    let id = if taskbar_is_light() { ICON_TRAY_ON_LIGHT } else { ICON_TRAY_ON_DARK };
+/// The tray icon in one colour, matching whatever the taskbar is, and faded
+/// when the line is empty — the same signal the Mac menu bar icon gives.
+fn tray_icon(instance: HINSTANCE, empty: bool) -> HICON {
+    let light = taskbar_is_light();
+    let id = match (light, empty) {
+        (true, false) => ICON_TRAY_ON_LIGHT,
+        (true, true) => ICON_TRAY_EMPTY_ON_LIGHT,
+        (false, false) => ICON_TRAY_ON_DARK,
+        (false, true) => ICON_TRAY_EMPTY_ON_DARK,
+    };
     load_icon(instance, id, true).unwrap_or_else(|| app_icon(instance, true))
 }
 /// How close to the top counts as touching it.
@@ -162,6 +175,8 @@ const MENU_REVEAL_CTRL: usize = 11;
 const MENU_REVEAL_ALT: usize = 12;
 const MENU_REVEAL_SHIFT: usize = 13;
 const MENU_HOTKEY: usize = 5;
+const MENU_STARTUP: usize = 6;
+const MENU_UPDATE: usize = 7;
 /// The per card menu. Numbers start well above the tray's so the two can
 /// never be confused.
 const CARD_PREVIEW: usize = 101;
@@ -169,6 +184,7 @@ const CARD_COPY: usize = 102;
 const CARD_COPY_FILE: usize = 103;
 const CARD_SAVE: usize = 104;
 const CARD_OPEN: usize = 105;
+const CARD_MARKUP: usize = 107;
 const CARD_REVEAL: usize = 106;
 const CARD_TAKE: usize = 111;
 const CARD_LEFT: usize = 112;
@@ -316,6 +332,13 @@ struct App {
     shell_menu: bool,
     /// What has to be held for the pointer against the top edge to count.
     reveal_key: RevealKey,
+    /// Whether the tray is showing the faded icon right now.
+    tray_empty: bool,
+    /// A picture opened in Paint: which one, what the file looked like before,
+    /// and when the watch started. Polled, not watched, so no extra threads.
+    markup_poll: Option<(usize, u128, Instant)>,
+    /// When the file was last looked at, to keep that to twice a second.
+    markup_polled: Instant,
     last_tick: Instant,
     /// Where the strip was last put, so pointer positions can be turned into
     /// card positions.
@@ -376,6 +399,9 @@ impl App {
             clip_pending: None,
             shell_menu: false,
             reveal_key: RevealKey::load(),
+            tray_empty: true,
+            markup_poll: None,
+            markup_polled: Instant::now(),
             last_tick: Instant::now(),
             origin: (0, 0),
             cards: Vec::new(),
@@ -703,6 +729,7 @@ impl App {
     /// new frame.
     fn refresh(&mut self) {
         self.prune_selection();
+        self.sync_tray_icon();
         self.painted = false;
         if self.shown {
             self.paint();
@@ -979,11 +1006,20 @@ impl App {
         let Some(shot) = self.shots.get(index) else {
             return;
         };
-        let opened = preview::open(self.hwnd, shot, self.monitor);
+        let opened = preview::open(self.hwnd, shot, index, self.shots.len(), self.monitor);
         clipboard::trace(&format!("preview of shot {index}: {opened}"));
         if opened {
             self.preview_open = true;
         }
+    }
+
+    /// The preview's arrow keys asked for another picture.
+    fn preview_step(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        preview::show(shot, index, self.shots.len());
+        clipboard::trace(&format!("preview stepped to {index}"));
     }
 
     fn preview_closed(&mut self) {
@@ -1064,6 +1100,56 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Opens the picture in Paint. Unlike "open with the default viewer",
+    /// Paint writes back to the same file, so the card can follow the edit.
+    fn markup(&mut self, index: usize) {
+        let Some(shot) = self.shots.get(index) else {
+            return;
+        };
+        let Some(path) = clipboard::ensure_file(shot) else {
+            clipboard::trace("markup: no file for that picture");
+            return;
+        };
+        let before = clipboard::modified(&path);
+        let mut arguments: Vec<u16> = format!("\"{}\"", path.display()).encode_utf16().collect();
+        arguments.push(0);
+        let launched = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("mspaint.exe"),
+                PCWSTR(arguments.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        clipboard::trace(&format!("markup of shot {index}: {:?}", launched.0));
+        self.markup_poll = Some((index, before, Instant::now()));
+    }
+
+    /// The editor has written the file: redraw the card from it. The card keeps
+    /// its identity — same slot, same selection — even though the pixels are
+    /// new, because to the person using it this is the same picture, edited.
+    fn reload(&mut self, index: usize) {
+        let Some(path) = self.shots.get(index).and_then(|shot| shot.path.clone()) else {
+            return;
+        };
+        let Some(fresh) = clipboard::shot_from_path(&path) else {
+            clipboard::trace("reload: the file could not be read back");
+            return;
+        };
+        let Some(slot) = self.shots.get_mut(index) else {
+            return;
+        };
+        slot.width = fresh.width;
+        slot.height = fresh.height;
+        slot.pixels = fresh.pixels;
+        self.painted = false;
+        self.refresh();
+        self.update_tip();
+        clipboard::trace(&format!("reloaded shot {index} after an edit"));
     }
 
     fn reveal(&mut self, index: usize) {
@@ -1204,6 +1290,9 @@ impl App {
             );
             let label = name("用默认看图程序打开");
             let _ = AppendMenuW(menu, MF_STRING, CARD_OPEN, PCWSTR(label.as_ptr()));
+            // Paint is the editor Windows ships that saves back to the same
+            // file, which is what makes the card able to follow the edit.
+            let _ = AppendMenuW(menu, MF_STRING, CARD_MARKUP, w!("标记（用画图）"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let label = name("取下这张");
             let _ = AppendMenuW(menu, MF_STRING, CARD_TAKE, PCWSTR(label.as_ptr()));
@@ -1238,6 +1327,7 @@ impl App {
             CARD_SAVE => self.save_copy(index),
             CARD_REVEAL => self.reveal(index),
             CARD_OPEN => self.open_with_viewer(index),
+            CARD_MARKUP => self.markup(index),
             CARD_TAKE => self.forget_group(index),
             CARD_LEFT => self.drop_side(index, true),
             CARD_RIGHT => self.drop_side(index, false),
@@ -1394,6 +1484,7 @@ impl App {
         self.last_tick = now;
 
         self.check_clipboard(now);
+        self.watch_markup();
 
         // A menu, a preview or a drag is in progress: the line holds still
         // underneath it.
@@ -1514,6 +1605,31 @@ impl App {
         }
     }
 
+    /// Paint has the picture open. Look at the file twice a second and redraw
+    /// the card when it changes; give up after a few minutes, because the
+    /// editor may never save and this must not run forever.
+    fn watch_markup(&mut self) {
+        let Some((index, before, since)) = self.markup_poll else {
+            return;
+        };
+        if since.elapsed().as_secs() > 180 {
+            self.markup_poll = None;
+            return;
+        }
+        if self.markup_polled.elapsed().as_millis() < 500 {
+            return;
+        }
+        self.markup_polled = Instant::now();
+        let Some(path) = self.shots.get(index).and_then(|shot| shot.path.clone()) else {
+            self.markup_poll = None;
+            return;
+        };
+        if clipboard::modified(&path) != before {
+            self.markup_poll = None;
+            self.reload(index);
+        }
+    }
+
     fn toggle(&mut self) {
         if self.target > 0.0 {
             self.peek_until = None;
@@ -1535,12 +1651,27 @@ impl App {
             uID: TRAY_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: tray_icon(HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0)),
+            hIcon: tray_icon(
+                HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0),
+                true,
+            ),
             ..Default::default()
         };
         let tip: Vec<u16> = "Picline".encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
+    }
+
+    /// The line went from empty to holding something, or back: the tray icon
+    /// fades in and out with it, so "is it running?" can be answered at a
+    /// glance without bringing the line down.
+    fn sync_tray_icon(&mut self) {
+        let empty = self.shots.is_empty();
+        if self.tray_empty == empty {
+            return;
+        }
+        self.tray_empty = empty;
+        self.refresh_tray_icon();
     }
 
     /// The taskbar went light or dark: swap the one-colour icon without
@@ -1552,7 +1683,7 @@ impl App {
             hWnd: self.hwnd,
             uID: TRAY_ID,
             uFlags: NIF_ICON,
-            hIcon: tray_icon(instance),
+            hIcon: tray_icon(instance, self.shots.is_empty()),
             ..Default::default()
         };
         unsafe {
@@ -1603,12 +1734,21 @@ impl App {
         };
         let _ = AppendMenuW(menu, shell, MENU_SHELL, w!("资源管理器右键「挂到 Picline」"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Launch at login: one registry value, ticked or not.
+        let startup_flag = if startup::enabled() {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(menu, startup_flag, MENU_STARTUP, w!("开机自启"));
         let shortcut = match hotkey::load() {
             Some(key) => format!("快捷键：{}…", key.label()),
             None => "快捷键：未设置…".to_string(),
         };
         let shortcut_label = wide(&shortcut);
         let _ = AppendMenuW(menu, MF_STRING, MENU_HOTKEY, PCWSTR(shortcut_label.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, MENU_UPDATE, w!("检查更新…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
         let picked = self.run_menu(menu);
@@ -1624,6 +1764,23 @@ impl App {
             MENU_CLEAR => self.take_everything_down(),
             MENU_SHELL => self.toggle_shell_menu(),
             MENU_HOTKEY => hotkey::record(self.hwnd),
+            MENU_STARTUP => {
+                let wanted = !startup::enabled();
+                if startup::set(wanted) {
+                    clipboard::trace(&format!("launch at login: {wanted}"));
+                } else {
+                    clipboard::trace("launch at login: could not write the Run key");
+                    unsafe {
+                        let _ = MessageBoxW(
+                            self.hwnd,
+                            w!("写不进启动项，可能是系统策略限制。"),
+                            w!("Picline"),
+                            MB_OK | MB_ICONWARNING,
+                        );
+                    }
+                }
+            }
+            MENU_UPDATE => update::check(self.hwnd),
             MENU_QUIT => {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -1863,6 +2020,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.preview_closed();
                 return LRESULT(0);
             }
+            preview::STEP => {
+                app.preview_step(wparam.0);
+                return LRESULT(0);
+            }
             WM_COPYDATA => {
                 let copy = &*(lparam.0 as *const COPYDATASTRUCT);
                 if copy.dwData == COPYDATA_PATHS && !copy.lpData.is_null() && copy.cbData >= 2 {
@@ -1903,6 +2064,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     MENU_CLEAR => app.take_everything_down(),
                     MENU_SHELL => app.toggle_shell_menu(),
                     MENU_HOTKEY => hotkey::record(hwnd),
+                    MENU_STARTUP => {
+                        let wanted = !startup::enabled();
+                        startup::set(wanted);
+                    }
+                    MENU_UPDATE => update::check(hwnd),
                     MENU_QUIT => {
                         let _ = DestroyWindow(hwnd);
                     }
