@@ -1,6 +1,6 @@
 [package]
 name = "picline"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Picline for Windows: a clothesline for screenshots that drops from the top edge"
 

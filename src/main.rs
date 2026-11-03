@@ -60,22 +60,71 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-/// The app icon lives in the exe as resource 1, compiled in by `build.rs`.
-/// Small is the tray and the title bar; large is Alt-Tab and Explorer.
-fn app_icon(instance: HINSTANCE, small: bool) -> HICON {
+/// Resource ids, compiled in by `build.rs`.
+const ICON_APP: u16 = 1;
+/// Light strokes, for a dark taskbar.
+const ICON_TRAY_ON_DARK: u16 = 2;
+/// Dark strokes, for a light taskbar.
+const ICON_TRAY_ON_LIGHT: u16 = 3;
+
+/// One icon out of the exe, at the size Windows asks for.
+fn load_icon(instance: HINSTANCE, id: u16, small: bool) -> Option<HICON> {
     unsafe {
         let (cx, cy) = if small {
             (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON))
         } else {
             (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON))
         };
-        match LoadImageW(instance, PCWSTR(1 as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR) {
-            Ok(handle) => HICON(handle.0),
-            // A build without windres has no resource; the system icon beats
-            // nothing at all in the tray.
-            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
-        }
+        LoadImageW(instance, PCWSTR(id as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
+            .ok()
+            .map(|handle| HICON(handle.0))
     }
+}
+
+/// The app icon: full colour, for Explorer, Alt-Tab and the title bar.
+fn app_icon(instance: HINSTANCE, small: bool) -> HICON {
+    load_icon(instance, ICON_APP, small)
+        // A build without windres has no resource; the system icon beats
+        // nothing at all in the tray.
+        .unwrap_or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() })
+}
+
+/// Whether the taskbar is the light one, which decides whether the tray icon
+/// is drawn in dark ink or light.
+fn taskbar_is_light() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut std::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    // No value at all means an older build or a policy; dark ink on a light bar
+    // still reads, so light is the safer guess.
+    status == windows::Win32::Foundation::WIN32_ERROR(0) && value != 0
+}
+
+/// Whether a Win32 wide string equals this text, for the `WM_SETTINGCHANGE`
+/// payload. Null means "something changed, no idea what".
+unsafe fn wide_equals(text: PCWSTR, expected: &str) -> bool {
+    if text.is_null() {
+        return false;
+    }
+    let wanted: Vec<u16> = expected.encode_utf16().collect();
+    text.as_wide() == wanted.as_slice()
+}
+
+/// The tray icon in one colour, matching whatever the taskbar is.
+fn tray_icon(instance: HINSTANCE) -> HICON {
+    let id = if taskbar_is_light() { ICON_TRAY_ON_LIGHT } else { ICON_TRAY_ON_DARK };
+    load_icon(instance, id, true).unwrap_or_else(|| app_icon(instance, true))
 }
 /// How close to the top counts as touching it.
 const BAND: i32 = 3;
@@ -1486,12 +1535,29 @@ impl App {
             uID: TRAY_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: app_icon(HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0), true),
+            hIcon: tray_icon(HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0)),
             ..Default::default()
         };
         let tip: Vec<u16> = "Picline".encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
+    }
+
+    /// The taskbar went light or dark: swap the one-colour icon without
+    /// waiting for a restart.
+    fn refresh_tray_icon(&self) {
+        let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap_or_default().0);
+        let data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_ICON,
+            hIcon: tray_icon(instance),
+            ..Default::default()
+        };
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
     }
 
     unsafe fn remove_tray(&self) {
@@ -1690,6 +1756,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_TIMER => {
                 app.tick();
                 return LRESULT(0);
+            }
+            WM_SETTINGCHANGE => {
+                // "ImmersiveColorSet" is the one that means the taskbar may
+                // have changed colour; anything else here is not our business.
+                if wide_equals(PCWSTR(lparam.0 as *const u16), "ImmersiveColorSet") {
+                    app.refresh_tray_icon();
+                    return LRESULT(0);
+                }
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             WM_CLIPBOARDUPDATE => {
                 // Noting it now and reading it a moment later avoids the
