@@ -1125,7 +1125,23 @@ impl App {
                 SW_SHOWNORMAL,
             )
         };
-        clipboard::trace(&format!("markup of shot {index}: {:?}", launched.0));
+        // ShellExecuteW answers with a value above 32 when it started
+        // something; anything at or below that is a failure code, and a
+        // failure here would otherwise look exactly like a menu item that does
+        // nothing at all.
+        if launched.0 as isize <= 32 {
+            clipboard::trace(&format!("markup of shot {index}: could not start Paint ({:?})", launched.0 as isize));
+            unsafe {
+                let _ = MessageBoxW(
+                    self.hwnd,
+                    w!("打不开画图。这台机器上可能没有 mspaint.exe。"),
+                    w!("Picline"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return;
+        }
+        clipboard::trace(&format!("markup of shot {index}: opened in Paint"));
         self.markup_poll = Some((index, before, Instant::now()));
     }
 
@@ -1291,8 +1307,10 @@ impl App {
             let label = name("用默认看图程序打开");
             let _ = AppendMenuW(menu, MF_STRING, CARD_OPEN, PCWSTR(label.as_ptr()));
             // Paint is the editor Windows ships that saves back to the same
-            // file, which is what makes the card able to follow the edit.
-            let _ = AppendMenuW(menu, MF_STRING, CARD_MARKUP, w!("标记（用画图）"));
+            // file, which is what makes the card able to follow the edit. The
+            // item is called 标记, the same word the Mac version uses; which
+            // editor opens is not the menu's business.
+            let _ = AppendMenuW(menu, MF_STRING, CARD_MARKUP, w!("标记"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let label = name("取下这张");
             let _ = AppendMenuW(menu, MF_STRING, CARD_TAKE, PCWSTR(label.as_ptr()));
