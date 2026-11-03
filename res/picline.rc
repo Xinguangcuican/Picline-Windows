@@ -1,0 +1,3 @@
+/* The app icon. Ordinal 1 is the first icon group, which is what Explorer
+   shows for the exe, and what the tray loads by id. */
+1 ICON "picline.ico"

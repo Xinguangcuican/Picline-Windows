@@ -59,6 +59,24 @@ use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// The app icon lives in the exe as resource 1, compiled in by `build.rs`.
+/// Small is the tray and the title bar; large is Alt-Tab and Explorer.
+fn app_icon(instance: HINSTANCE, small: bool) -> HICON {
+    unsafe {
+        let (cx, cy) = if small {
+            (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON))
+        } else {
+            (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON))
+        };
+        match LoadImageW(instance, PCWSTR(1 as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR) {
+            Ok(handle) => HICON(handle.0),
+            // A build without windres has no resource; the system icon beats
+            // nothing at all in the tray.
+            Err(_) => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        }
+    }
+}
 /// How close to the top counts as touching it.
 const BAND: i32 = 3;
 /// Resting this long against the edge brings the line down. Long enough that a
@@ -1468,7 +1486,7 @@ impl App {
             uID: TRAY_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: app_icon(HINSTANCE(GetModuleHandleW(None).unwrap_or_default().0), true),
             ..Default::default()
         };
         let tip: Vec<u16> = "Picline".encode_utf16().collect();

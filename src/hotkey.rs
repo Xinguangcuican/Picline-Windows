@@ -186,6 +186,9 @@ pub fn record(owner: HWND) {
         let definition = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: HINSTANCE(instance.0),
+            // The recorder is the one window with a title bar, so it is the one
+            // that shows the app icon in the corner and in Alt-Tab.
+            hIcon: crate::app_icon(HINSTANCE(instance.0), false),
             lpszClassName: class,
             hbrBackground: HBRUSH(6 as *mut c_void),
             ..Default::default()
