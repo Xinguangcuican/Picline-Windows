@@ -6,7 +6,7 @@ Mac 上那条「截图晾衣绳」的 Windows 版。
 
 | 能用 | 说明 |
 | --- | --- |
-| 贴顶唤出 | 指针停到任意屏幕最上面 3 像素内满 0.09 秒，绳子从屏幕顶边滑下来 |
+| 贴顶唤出 | 指针停到任意屏幕最上面 3 像素内满 0.09 秒，绳子从屏幕顶边滑下来；**绳子上没有图时不会下来** |
 | **快捷键可自定义** | 托盘右键 →「快捷键：Ctrl + Alt + T…」，按一遍新的组合即可（Esc 取消，Delete 取消设置）；被别的程序占用时会提示并保留原来的 |
 | **贴顶唤出可要求按键** | 托盘右键 →「贴顶唤出」→ 不需要按键 / 按住 `Ctrl` / 按住 `Alt` / 按住 `Shift`；选了键之后不按就不放下来，选择记在 `%LOCALAPPDATA%\Picline\settings.txt`，重启保留 |
 | 自动收回 | 指针离开绳子区域 0.5 秒，绳子滑回去，窗口隐藏，不留痕迹 |
@@ -56,7 +56,7 @@ Windows 11 的「新式菜单」之所以进不去，是因为它只接受 MSIX 
 
 ## 怎么试
 
-1. 把 `Picline-0.1.9-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
+1. 把 `Picline-0.1.10-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
 2. 双击。首次运行会因为未签名被 SmartScreen 拦一下：点「更多信息 → 仍要运行」。
 3. 用微信截图、`Win + Shift + S`、或随手复制一张图片。
 4. 绳子应该自己下来，图片以卡片形式挂上去，1.6 秒后收回。
@@ -113,8 +113,8 @@ scripts/build-win.sh both      # 产物在 dist/
 
 | 文件 | 架构 | 大小 | PE |
 | --- | --- | --- | --- |
-| `dist/Picline-0.1.9-win-x64.exe` | x86_64 | 367 KB | PE32+ / Windows GUI |
-| `dist/Picline-0.1.9-win-arm64.exe` | ARM64 | 299 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.10-win-x64.exe` | x86_64 | 367 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.10-win-arm64.exe` | ARM64 | 299 KB | PE32+ / Windows GUI |
 
 ## 代码结构
 
