@@ -1,7 +1,10 @@
 /* 1 is the app icon: Explorer, Alt-Tab, the exe file itself. Explorer takes the
    first group in this table, so it has to stay first.
    2 and 3 are the tray icon in one colour, chosen at run time by whether the
-   taskbar is dark or light. */
+   taskbar is dark or light. 4 and 5 are the same drawing faded, for when
+   nothing is hanging. */
 1 ICON "picline.ico"
 2 ICON "picline-tray-on-dark.ico"
 3 ICON "picline-tray-on-light.ico"
+4 ICON "picline-tray-empty-on-dark.ico"
+5 ICON "picline-tray-empty-on-light.ico"

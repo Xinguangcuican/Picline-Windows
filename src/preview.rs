@@ -1,8 +1,13 @@
-//! A full screen look at one picture.
+//! A full screen look at the pictures on the line.
 //!
 //! The line itself is too small to read anything from, so a click on a card
 //! opens this: the desktop dimmed, the picture as large as the screen allows,
-//! its name and pixel size underneath. Any click, or Escape, puts it away.
+//! its name and pixel size underneath. Left and right walk the line while it is
+//! open, Escape or a click puts it away.
+//!
+//! Only one picture's pixels are held here at a time. Stepping asks the line
+//! for the next one, because copying twelve 4K pictures into this window would
+//! cost several hundred megabytes to show one of them.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
@@ -10,6 +15,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::canvas::Canvas;
@@ -19,6 +25,8 @@ use crate::gdiplus::Painter;
 /// Posted to the line's window when a preview closes, so the line can put
 /// itself back on top of everything.
 pub const CLOSED: u32 = WM_APP + 2;
+/// Posted to the line when the arrow keys ask for another picture.
+pub const STEP: u32 = WM_APP + 4;
 
 /// The preview on screen, if any. Replacing one must not look like closing it,
 /// so the window that goes away checks that it is still the current one.
@@ -31,14 +39,19 @@ fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
 struct State {
     canvas: Canvas,
     shot: Shot,
+    /// Where this picture sits in the line, and how long the line is.
+    index: usize,
+    count: usize,
     scale: f32,
     owner: HWND,
     origin: (i32, i32),
+    /// Whoever had the keyboard before the preview took it.
+    previous: HWND,
 }
 
 /// Shows `shot` over the whole of `monitor`. Returns once it is up; the window
-/// closes itself when it is clicked.
-pub fn open(owner: HWND, shot: &Shot, monitor: RECT) -> bool {
+/// closes itself when it is clicked or Escape is pressed.
+pub fn open(owner: HWND, shot: &Shot, index: usize, count: usize, monitor: RECT) -> bool {
     unsafe {
         // One at a time: clicking a second card replaces the first preview.
         // Clearing the marker first means the old window does not report a
@@ -86,22 +99,23 @@ pub fn open(owner: HWND, shot: &Shot, monitor: RECT) -> bool {
         let scale = (height as f32 / 900.0).clamp(0.85, 2.0);
         let state = Box::into_raw(Box::new(State {
             canvas,
-            shot: Shot {
-                width: shot.width,
-                height: shot.height,
-                pixels: shot.pixels.clone(),
-                hash: shot.hash,
-                path: shot.path.clone(),
-            },
+            shot: copy(shot),
+            index,
+            count,
             scale,
             owner,
             origin: (monitor.left, monitor.top),
+            previous: GetForegroundWindow(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
         CURRENT.store(hwnd.0 as isize, Ordering::SeqCst);
         paint(&*state);
 
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Activated rather than shown quietly: the arrow keys have to reach
+        // this window, and a window that never takes focus never gets them.
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(hwnd);
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -109,9 +123,41 @@ pub fn open(owner: HWND, shot: &Shot, monitor: RECT) -> bool {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
         true
+    }
+}
+
+/// Replaces what the open preview is showing. Called when the line answers a
+/// `STEP` request.
+pub fn show(shot: &Shot, index: usize, count: usize) {
+    let pointer = CURRENT.load(Ordering::SeqCst);
+    if pointer == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(pointer as *mut std::ffi::c_void);
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+        if state.is_null() {
+            return;
+        }
+        let state = &mut *state;
+        state.shot = copy(shot);
+        state.index = index;
+        state.count = count;
+        paint(state);
+    }
+}
+
+/// A shot of our own: the preview outlives the call that opened it.
+fn copy(shot: &Shot) -> Shot {
+    Shot {
+        width: shot.width,
+        height: shot.height,
+        pixels: shot.pixels.clone(),
+        hash: shot.hash,
+        path: shot.path.clone(),
     }
 }
 
@@ -171,7 +217,13 @@ fn paint(state: &State) {
         argb(90, 255, 255, 255),
     );
 
-    let caption = state.shot.caption();
+    // "3 / 7 · 截图.png · 2560 × 1440" — where you are matters more than the
+    // file name once there are several.
+    let caption = if state.count > 1 {
+        format!("{} / {} · {}", state.index + 1, state.count, state.shot.caption())
+    } else {
+        state.shot.caption()
+    };
     painter.text_centered(
         &caption,
         image_x,
@@ -181,8 +233,13 @@ fn paint(state: &State) {
         12.5 * scale,
         argb(235, 255, 255, 255),
     );
+    let hint = if state.count > 1 {
+        "← → 翻看　·　点任意位置或 Esc 收起"
+    } else {
+        "点任意位置或 Esc 收起"
+    };
     painter.text_centered(
-        "点任意位置收起 · 右键卡片可复制或另存",
+        hint,
         0.0,
         height - 34.0 * scale,
         width,
@@ -204,16 +261,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = DestroyWindow(hwnd);
             return LRESULT(0);
         }
-        WM_KEYDOWN if wparam.0 == 0x1B => {
-            let _ = DestroyWindow(hwnd);
-            return LRESULT(0);
+        WM_KEYDOWN => {
+            let key = wparam.0 as u16;
+            match key {
+                0x1B | 0x20 => {
+                    // Escape, and Space as Quick Look on the Mac does it.
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
+                _ if !pointer.is_null() => {
+                    let state = &*pointer;
+                    let wanted = match key {
+                        0x25 => state.index.checked_sub(1),          // left
+                        0x27 => Some(state.index + 1),                // right
+                        0x24 => Some(0),                              // home
+                        0x23 => Some(state.count.saturating_sub(1)),   // end
+                        _ => None,
+                    };
+                    if let Some(next) = wanted {
+                        if next < state.count && next != state.index {
+                            // The pixels live in the line; ask it for them.
+                            let _ = PostMessageW(
+                                state.owner,
+                                STEP,
+                                WPARAM(next),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
         }
         WM_DESTROY => {
             if !pointer.is_null() {
                 let state = Box::from_raw(pointer);
                 let owner = state.owner;
+                let previous = state.previous;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(state);
+                // Give the keyboard back to whoever had it.
+                if !previous.is_invalid() {
+                    let _ = SetForegroundWindow(previous);
+                }
                 if CURRENT.swap(0, Ordering::SeqCst) == hwnd.0 as isize {
                     let _ = PostMessageW(owner, CLOSED, WPARAM(0), LPARAM(0));
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "picline"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "Picline for Windows: a clothesline for screenshots that drops from the top edge"
 
@@ -8,9 +8,12 @@ description = "Picline for Windows: a clothesline for screenshots that drops fro
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
   "Win32_Security",
   "Win32_System_LibraryLoader",
   "Win32_System_SystemServices",
+  "Win32_Networking_WinHttp",
+  "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_Registry",
   "Win32_System_Threading",
