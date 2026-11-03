@@ -31,6 +31,7 @@ Mac 上那条「截图晾衣绳」的 Windows 版。
 | 多屏与缩放 | 在哪块屏幕上贴顶，就下在哪块；按该屏的缩放比例绘制 |
 | 全屏不打扰 | 检测到全屏应用或演示模式时不出来，收到图也不弹 |
 | 单实例 | 重复双击不会出现两条绳子 |
+| **自带的图标** | exe 里嵌了自己的图标（16–256 九种尺寸），托盘、标题栏、资源管理器里都是它，不再是 Windows 的通用程序图标 |
 
 指针只有在**卡片上面**的时候才「接住」鼠标，其余位置一律穿透。所以整条绳子不会挡住最大化窗口右上角的最小化 / 关闭按钮。
 
@@ -56,7 +57,7 @@ Windows 11 的「新式菜单」之所以进不去，是因为它只接受 MSIX 
 
 ## 怎么试
 
-1. 把 `Picline-0.1.10-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
+1. 把 `Picline-0.1.11-win-x64.exe` 拷到 Windows 机器上（ARM 机器用 `-win-arm64.exe`）。
 2. 双击。首次运行会因为未签名被 SmartScreen 拦一下：点「更多信息 → 仍要运行」。
 3. 用微信截图、`Win + Shift + S`、或随手复制一张图片。
 4. 绳子应该自己下来，图片以卡片形式挂上去，1.6 秒后收回。
@@ -113,13 +114,15 @@ scripts/build-win.sh both      # 产物在 dist/
 
 | 文件 | 架构 | 大小 | PE |
 | --- | --- | --- | --- |
-| `dist/Picline-0.1.10-win-x64.exe` | x86_64 | 367 KB | PE32+ / Windows GUI |
-| `dist/Picline-0.1.10-win-arm64.exe` | ARM64 | 299 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.11-win-x64.exe` | x86_64 | 496 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.11-win-arm64.exe` | ARM64 | 428 KB | PE32+ / Windows GUI |
 
 ## 代码结构
 
 | 文件 | 职责 |
 | --- | --- |
+| `res/picline.ico`、`res/picline.rc` | 应用图标与资源脚本；16/20/24 是照着小尺寸重画的，32 以上用主图缩放 |
+| `build.rs` | 用 windres 把图标编成 COFF 对象再交给链接器（GNU 目标没有别的办法）；找不到 windres 时只警告，不影响编译 |
 | `src/hotkey.rs` | 快捷键：解析、注册、以及按一遍就记下的录制窗口 |
 | `src/settings.rs` | 用户选择的持久化：`%LOCALAPPDATA%\Picline\settings.txt` 里的 key=value |
 | `src/main.rs` | 窗口、消息循环、贴顶状态机、动画、卡片排版、悬停与命中测试、卡片右键菜单、托盘、热键、命令行 `--hang`、单实例转发 |
