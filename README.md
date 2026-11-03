@@ -119,8 +119,8 @@ scripts/build-win.sh both      # 产物在 dist/
 
 | 文件 | 架构 | 大小 | PE |
 | --- | --- | --- | --- |
-| `dist/Picline-0.1.1-win-x64.exe` | x86_64 | 560 KB | PE32+ / Windows GUI |
-| `dist/Picline-0.1.1-win-arm64.exe` | ARM64 | 490 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.1-win-x64.exe` | x86_64 | 563 KB | PE32+ / Windows GUI |
+| `dist/Picline-0.1.1-win-arm64.exe` | ARM64 | 492 KB | PE32+ / Windows GUI |
 
 ## 代码结构
 
