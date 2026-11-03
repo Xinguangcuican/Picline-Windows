@@ -1360,7 +1360,11 @@ impl App {
         // Coming down: rest against the top edge long enough, and not while a
         // full screen app owns that screen.
         if self.target < 1.0 {
-            if against_edge && !fullscreen_busy() && self.reveal_key.held() {
+            // An empty line stays away: reaching for the top edge to get at
+            // another window should not bring a bare rope down every time.
+            // The hot key and the tray still open it.
+            let has_pictures = !self.shots.is_empty();
+            if against_edge && has_pictures && !fullscreen_busy() && self.reveal_key.held() {
                 let since = *self.hot_since.get_or_insert(now);
                 if now.duration_since(since) >= REVEAL_DELAY {
                     self.hot_since = None;
