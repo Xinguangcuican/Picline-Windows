@@ -13,8 +13,10 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MessageBoxW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, WM_APP,
 };
+
+use crate::settings;
 
 use crate::wide;
 
@@ -24,6 +26,64 @@ const DOWNLOAD: &str = "https://github.com/Xinguangcuican/Picline/releases/lates
 
 /// Our own version, decided at build time by Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Posted to the line when a background check finds something newer.
+pub const FOUND: u32 = WM_APP + 5;
+
+/// What that check found, waiting for the window to pick it up. A message can
+/// carry two numbers; a version is a string, so it waits here.
+static FOUND_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Takes the version the background check found, if any.
+pub fn found() -> Option<String> {
+    FOUND_VERSION.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Once a day, quietly, in the background: the same question the menu asks,
+/// but asked without being asked. A release nobody hears about is a release
+/// that did not happen.
+pub fn auto(hwnd: HWND) {
+    let last: u64 = settings::get("updateCheckedAt")
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Every twenty-four hours, and not before.
+    if now.saturating_sub(last) < 24 * 3600 {
+        return;
+    }
+    settings::set("updateCheckedAt", &now.to_string());
+
+    let owner = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let Ok(json) = fetch() else {
+            crate::clipboard::trace("update check: no answer");
+            return;
+        };
+        let Some(latest) = windows_version_from_json(&json) else {
+            crate::clipboard::trace("update check: no Windows build in the latest release");
+            return;
+        };
+        if !newer(&latest, VERSION) {
+            crate::clipboard::trace("update check: already current");
+            return;
+        }
+        crate::clipboard::trace(&format!("update check: {latest} is out"));
+        if let Ok(mut slot) = FOUND_VERSION.lock() {
+            *slot = Some(latest);
+        }
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                HWND(owner as *mut c_void),
+                FOUND,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+    });
+}
 
 /// Checks in the background and reports with a message box. The line keeps
 /// working while it runs.

@@ -57,9 +57,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
-    SHQueryUserNotificationState,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, QUNS_BUSY,
+    QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -339,6 +339,14 @@ struct App {
     markup_poll: Option<(usize, u128, Instant)>,
     /// When the file was last looked at, to keep that to twice a second.
     markup_polled: Instant,
+    /// First run: the rope has come down on its own to introduce itself, and
+    /// the empty line says how to call it back.
+    coach: bool,
+    /// When that introduction ends by itself.
+    coach_until: Option<Instant>,
+    /// When the daily look for a new release last ran. Checked on the tick,
+    /// which is far too often to be reading a settings file.
+    update_poll: Instant,
     last_tick: Instant,
     /// Where the strip was last put, so pointer positions can be turned into
     /// card positions.
@@ -402,6 +410,9 @@ impl App {
             tray_empty: true,
             markup_poll: None,
             markup_polled: Instant::now(),
+            coach: false,
+            coach_until: None,
+            update_poll: Instant::now(),
             last_tick: Instant::now(),
             origin: (0, 0),
             cards: Vec::new(),
@@ -532,21 +543,35 @@ impl App {
 
             if self.shots.is_empty() {
                 let hint = "截图、复制图片，或右键「挂到 Picline」";
+                // First run: the rope has come down on its own, and it says
+                // the one thing a new line needs — how to get it back.
+                let asides: Vec<&str> = if self.coach {
+                    vec![hint, "指针推到屏幕最上面，它就会下来"]
+                } else {
+                    vec![hint]
+                };
                 let font = 12.0 * scale;
-                let capsule_w = hint.chars().count() as f32 * font + 26.0 * scale;
-                let capsule_h = font + 14.0 * scale;
+                let widest = asides
+                    .iter()
+                    .map(|line| line.chars().count() as f32 * font)
+                    .fold(0.0, f32::max);
+                let line_h = font + 6.0 * scale;
+                let capsule_w = widest + 26.0 * scale;
+                let capsule_h = line_h * asides.len() as f32 + 12.0 * scale;
                 let capsule_x = width / 2.0 - capsule_w / 2.0;
                 let capsule_y = middle + 34.0 * scale - capsule_h / 2.0;
                 painter.capsule(capsule_x, capsule_y, capsule_w, capsule_h, argb(150, 28, 28, 28));
-                painter.text_centered(
-                    hint,
-                    capsule_x,
-                    capsule_y - 1.0,
-                    capsule_w,
-                    capsule_h + 2.0,
-                    font,
-                    argb(235, 255, 255, 255),
-                );
+                for (n, line) in asides.iter().enumerate() {
+                    painter.text_centered(
+                        line,
+                        capsule_x,
+                        capsule_y + 6.0 * scale + line_h * n as f32,
+                        capsule_w,
+                        line_h,
+                        if n == 0 { font } else { font - 1.0 * scale },
+                        if n == 0 { argb(240, 255, 255, 255) } else { argb(190, 235, 235, 235) },
+                    );
+                }
             } else {
                 let cards = self.card_layout(width, middle, scale);
                 for card in &cards {
@@ -941,7 +966,13 @@ impl App {
 
         let mut paths: Vec<PathBuf> = Vec::new();
         for at in &indices {
-            match self.shots.get(*at).and_then(clipboard::ensure_drag_file) {
+            // Mutable: the card remembers the file it was carried out as, so
+            // dragging it again reuses that one instead of writing another.
+            let made = self
+                .shots
+                .get_mut(*at)
+                .and_then(clipboard::ensure_drag_file);
+            match made {
                 Some(path) => paths.push(path),
                 None => clipboard::trace(&format!("drag: no file for shot {at}")),
             }
@@ -1195,6 +1226,12 @@ impl App {
         if index >= self.shots.len() {
             return;
         }
+        // Taking a card down means its file goes too — but only a file this
+        // app made for it. A photo hung from the person's own folder is
+        // theirs, and taking it off the line leaves it where it was.
+        for file in self.own_files(index) {
+            clipboard::recycle(&file);
+        }
         self.shots.remove(index);
         self.hover = None;
         self.update_tip();
@@ -1203,6 +1240,28 @@ impl App {
             self.retract_to_zero();
         }
         self.refresh();
+    }
+
+    /// The temporary files this card is responsible for: the copy it was
+    /// carried out as, and the one written by "copy as file". Nothing here
+    /// belongs to the person, or it would not be in the temp folder.
+    fn own_files(&self, index: usize) -> Vec<PathBuf> {
+        let Some(shot) = self.shots.get(index) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = Vec::new();
+        if let Some(path) = &shot.drag_file {
+            files.push(path.clone());
+        }
+        if shot.path.is_none() {
+            let cache = std::env::temp_dir()
+                .join("Picline")
+                .join(format!("picline-{:016x}.png", shot.hash));
+            if cache.is_file() {
+                files.push(cache);
+            }
+        }
+        files
     }
 
     /// The menu's "取下这张": the whole picked group when the card is part of
@@ -1503,6 +1562,11 @@ impl App {
 
         self.check_clipboard(now);
         self.watch_markup();
+        self.end_greeting(now);
+        if now.duration_since(self.update_poll).as_secs() >= 600 {
+            self.update_poll = now;
+            update::auto(self.hwnd);
+        }
 
         // A menu, a preview or a drag is in progress: the line holds still
         // underneath it.
@@ -1645,6 +1709,55 @@ impl App {
         if clipboard::modified(&path) != before {
             self.markup_poll = None;
             self.reload(index);
+        }
+    }
+
+    /// The first run: the rope comes down on its own, says what hangs on it,
+    /// and how to call it back. Nobody installs this and discovers a bare menu
+    /// bar icon; the thing introduces itself once.
+    fn greet(&mut self) {
+        if settings::get("welcomed").is_some() {
+            return;
+        }
+        settings::set("welcomed", "1");
+        self.coach = true;
+        self.coach_until = Some(Instant::now() + std::time::Duration::from_secs(9));
+        self.toggle();
+    }
+
+    /// The introduction has had its nine seconds: put the words away, and let
+    /// an empty line go back up.
+    fn end_greeting(&mut self, now: Instant) {
+        let Some(until) = self.coach_until else { return };
+        if now < until {
+            return;
+        }
+        self.coach_until = None;
+        self.coach = false;
+        if self.shots.is_empty() {
+            self.pinned = false;
+            self.retract_to_zero();
+        }
+        self.refresh();
+    }
+
+    /// A tray balloon: Windows' own way of saying something without stealing
+    /// the window you are working in.
+    fn notify(&self, title: &str, body: &str) {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_INFO,
+            ..Default::default()
+        };
+        let title_wide: Vec<u16> = title.encode_utf16().take(63).collect();
+        data.szInfoTitle[..title_wide.len()].copy_from_slice(&title_wide);
+        let body_wide: Vec<u16> = body.encode_utf16().take(255).collect();
+        data.szInfo[..body_wide.len()].copy_from_slice(&body_wide);
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
 
@@ -2038,6 +2151,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 app.preview_closed();
                 return LRESULT(0);
             }
+            update::FOUND => {
+                if let Some(version) = update::found() {
+                    app.notify(
+                        &format!("Picline {version} 有新版本"),
+                        "托盘右键 →「检查更新…」打开下载页",
+                    );
+                }
+                return LRESULT(0);
+            }
             preview::STEP => {
                 app.preview_step(wparam.0);
                 return LRESULT(0);
@@ -2181,6 +2303,14 @@ fn main() {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).menu_owner = menu_owner(HINSTANCE(instance.0));
         (*app).add_tray();
+
+        // Whatever earlier runs left in the temp folder goes now, so the
+        // folder does not grow a little more every day.
+        clipboard::sweep_leftovers();
+        // The first run introduces itself; every run asks GitHub, quietly,
+        // whether there is a newer build.
+        (*app).greet();
+        update::auto(hwnd);
 
         // Put "挂到 Picline" in Explorer's right-click menu. Rewritten on every
         // start so it always points at wherever the exe lives now, and it stays

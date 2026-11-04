@@ -115,6 +115,10 @@ pub struct Shot {
     /// Where it came from, when it came from a file rather than the clipboard.
     /// The caption in the preview and "show in Explorer" both need it.
     pub path: Option<PathBuf>,
+    /// The temporary file this card is carried out as, once it has been
+    /// dragged somewhere. Kept so the second drag of the same picture reuses
+    /// it instead of writing another copy into %TEMP%; recycled with the card.
+    pub drag_file: Option<PathBuf>,
 }
 
 impl Shot {
@@ -126,6 +130,7 @@ impl Shot {
             pixels,
             hash,
             path: None,
+            drag_file: None,
         }
     }
 
@@ -292,6 +297,92 @@ pub fn shot_from_path(path: &std::path::Path) -> Option<Shot> {
     let mut shot = Shot::new(raw.width, raw.height, raw.pixels);
     shot.path = Some(path.to_path_buf());
     Some(shot)
+}
+
+/// Clears what earlier runs left behind in the temp folder.
+///
+/// Everything under `%TEMP%\Picline` is this app's own making — copies made to
+/// drag a picture out, or to paste it as a file. Taking a card down recycles
+/// its copy now, but a crash or a kill can leave one behind, and the old
+/// builds left one per drag. A week is longer than any of these is useful.
+pub fn sweep_leftovers() {
+    let root = std::env::temp_dir().join("Picline");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let old = std::time::Duration::from_secs(7 * 24 * 3600);
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // The drag folder holds the same kind of thing one level down.
+            if let Ok(inner) = std::fs::read_dir(&path) {
+                for file in inner.flatten() {
+                    if stale(&file.path(), old) && std::fs::remove_file(file.path()).is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        if stale(&path, old) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        trace(&format!("swept {removed} old temporary file(s)"));
+    }
+}
+
+/// Older than `age`, as far as the file system will say.
+fn stale(path: &std::path::Path, age: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .map(|since| since > age)
+        .unwrap_or(false)
+}
+
+/// Sends our own leftovers to the Recycle Bin, the way Explorer's Delete does:
+/// the same file is recoverable, and nothing vanishes without a way back.
+///
+/// Only files this app made for itself are ever offered here — a photo the
+/// person hung from their own folder is theirs, and leaving the line must not
+/// touch it.
+pub fn recycle(path: &std::path::Path) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI,
+        FOF_SILENT, FO_DELETE,
+    };
+
+    if !path.is_file() {
+        return false;
+    }
+    // A double-null-terminated list, which is what the shell asks for.
+    let mut list: Vec<u16> = path.as_os_str().encode_wide().collect();
+    list.push(0);
+    list.push(0);
+
+    let mut operation = SHFILEOPSTRUCTW {
+        hwnd: Default::default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(list.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        fAnyOperationsAborted: Default::default(),
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: PCWSTR::null(),
+    };
+    let result = unsafe { SHFileOperationW(&mut operation) };
+    let ok = result == 0 && !operation.fAnyOperationsAborted.as_bool();
+    trace(&format!(
+        "recycle {}: {}",
+        path.display(),
+        if ok { "ok" } else { "failed" }
+    ));
+    ok
 }
 
 /// When the file was last written, in nanoseconds. Used to notice that an
@@ -617,10 +708,18 @@ pub fn ensure_file(shot: &Shot) -> Option<PathBuf> {
 /// A file to hand to another program when a card is dragged out. A picture
 /// that came from a file is offered as that very file; anything else is
 /// written out with a name a person would recognise in a chat window.
-pub fn ensure_drag_file(shot: &Shot) -> Option<PathBuf> {
+pub fn ensure_drag_file(shot: &mut Shot) -> Option<PathBuf> {
     if let Some(path) = &shot.path {
         if path.is_file() {
             return Some(path.clone());
+        }
+    }
+    // Carried before: the same file, not another copy. Dragging one picture
+    // five times used to leave five PNGs in the temp folder, none of which
+    // anything would ever remove.
+    if let Some(cached) = &shot.drag_file {
+        if cached.is_file() {
+            return Some(cached.clone());
         }
     }
     let folder = std::env::temp_dir().join("Picline").join("drag");
@@ -633,6 +732,7 @@ pub fn ensure_drag_file(shot: &Shot) -> Option<PathBuf> {
         count += 1;
     }
     if crate::gdiplus::save_png(&shot.pixels, shot.width, shot.height, &path) {
+        shot.drag_file = Some(path.clone());
         Some(path)
     } else {
         None

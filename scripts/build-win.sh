@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-VERSION="${PICLINE_VERSION:-0.2.4}"
+VERSION="${PICLINE_VERSION:-0.2.5}"
 WHICH="${1:-both}"
 DIST="dist"
 mkdir -p "$DIST"
