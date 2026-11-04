@@ -10,7 +10,13 @@ use std::ffi::c_void;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Networking::WinHttp::*;
+use windows::Win32::Networking::WinHttp::{
+    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
+    WinHttpReadData,
+    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY,
+    WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, WM_APP,
@@ -22,6 +28,8 @@ use crate::wide;
 
 const HOST: &str = "api.github.com";
 const PATH: &str = "/repos/Xinguangcuican/Picline/releases/latest";
+const HOST_PAGE: &str = "github.com";
+const PATH_PAGE: &str = "/Xinguangcuican/Picline/releases/latest";
 const DOWNLOAD: &str = "https://github.com/Xinguangcuican/Picline/releases/latest";
 
 /// Our own version, decided at build time by Cargo.toml.
@@ -58,12 +66,8 @@ pub fn auto(hwnd: HWND) {
 
     let owner = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let Ok(json) = fetch() else {
+        let Ok(latest) = latest() else {
             crate::clipboard::trace("update check: no answer");
-            return;
-        };
-        let Some(latest) = windows_version_from_json(&json) else {
-            crate::clipboard::trace("update check: no Windows build in the latest release");
             return;
         };
         if !newer(&latest, VERSION) {
@@ -90,27 +94,11 @@ pub fn auto(hwnd: HWND) {
 pub fn check(owner: HWND) {
     let owner = owner.0 as isize;
     std::thread::spawn(move || {
-        let result = fetch();
+        let result = latest();
         let owner = HWND(owner as *mut c_void);
         unsafe {
             match result {
-                Ok(json) => {
-                    // The tag is the macOS version (v0.2.9); the Windows build
-                    // has its own line, so the answer has to come from the
-                    // asset names — "Picline-0.1.1-win-x64.exe" and friends.
-                    let Some(latest) = windows_version_from_json(&json) else {
-                        let text = format!(
-                            "最新一次发布里没有 Windows 包。\n\n当前版本 {VERSION}。"
-                        );
-                        let wide_text = wide(&text);
-                        MessageBoxW(
-                            owner,
-                            PCWSTR(wide_text.as_ptr()),
-                            w!("Picline 更新"),
-                            MB_OK | MB_ICONINFORMATION,
-                        );
-                        return;
-                    };
+                Ok(latest) => {
                     if newer(&latest, VERSION) {
                         let text = format!(
                             "有新的 Windows 版 {latest}（当前 {VERSION}）。\n\n要打开下载页面吗？"
@@ -157,6 +145,131 @@ pub fn check(owner: HWND) {
             }
         }
     });
+}
+
+/// The version this app should compare itself against.
+///
+/// The cheap route first: `github.com/.../releases/latest` redirects to
+/// `/releases/tag/vX.Y.Z`, so the tag can be read off the page it lands on. The
+/// API is the fallback — it answers with the whole release, which is what the
+/// Windows build has to be picked out of, but it also allows sixty requests an
+/// hour per address and a shared connection can use those up without trying.
+fn latest() -> Result<String, String> {
+    if let Ok(tag) = page_tag() {
+        let cleaned = tag.trim_start_matches('v');
+        if !cleaned.is_empty() {
+            return Ok(cleaned.to_string());
+        }
+    }
+    let json = fetch()?;
+    windows_version_from_json(&json).ok_or_else(|| "最新一次发布里没有 Windows 包".to_string())
+}
+
+/// The tag at the end of the redirect, scraped from the page's own links.
+fn page_tag() -> Result<String, String> {
+    let host = wide(HOST_PAGE);
+    let path = wide(PATH_PAGE);
+    unsafe {
+        let session = WinHttpOpen(
+            PCWSTR(host.as_ptr()),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err("无法初始化网络".into());
+        }
+        let _ = WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+        let connect = WinHttpConnect(session, PCWSTR(host.as_ptr()), 443, 0);
+        if connect.is_null() {
+            let _ = WinHttpCloseHandle(session);
+            return Err("无法连接 GitHub".into());
+        }
+        let request = WinHttpOpenRequest(
+            connect,
+            w!("GET"),
+            PCWSTR(path.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            std::ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        );
+        if request.is_null() {
+            let _ = WinHttpCloseHandle(connect);
+            let _ = WinHttpCloseHandle(session);
+            return Err("无法建立请求".into());
+        }
+        // Follow the redirect to the tag page, so its links are in the body.
+        let policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS.to_le_bytes();
+        let _ = WinHttpSetOption(
+            Some(request as *const c_void),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(&policy),
+        );
+
+        let mut answer: Result<String, String> = Err("请求未发出".into());
+        if WinHttpSendRequest(request, None, None, 0, 0, 0).is_ok()
+            && WinHttpReceiveResponse(request, std::ptr::null_mut()).is_ok()
+        {
+            let mut body: Vec<u8> = Vec::new();
+            loop {
+                let mut available: u32 = 0;
+                if WinHttpQueryDataAvailable(request, &mut available).is_err() || available == 0 {
+                    break;
+                }
+                let mut chunk = vec![0u8; available as usize];
+                let mut read: u32 = 0;
+                if WinHttpReadData(request, chunk.as_mut_ptr() as *mut c_void, available, &mut read)
+                    .is_err()
+                    || read == 0
+                {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read as usize]);
+                // The canonical link is in the head of the document; there is
+                // no reason to pull a whole page over for one string.
+                if body.len() > 256 * 1024 {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&body);
+            answer = match tag_in_page(&text) {
+                Some(tag) => Ok(tag),
+                None => Err("页面上没有版本号".into()),
+            };
+        }
+
+        let _ = WinHttpCloseHandle(request);
+        let _ = WinHttpCloseHandle(connect);
+        let _ = WinHttpCloseHandle(session);
+        answer
+    }
+}
+
+/// `v0.2.5` out of any `/releases/tag/v0.2.5` the page mentions.
+///
+/// The first one is not it: GitHub puts `/releases/tag/*name` in a template
+/// above the real link. So the page is walked until something shaped like a
+/// version turns up.
+fn tag_in_page(html: &str) -> Option<String> {
+    const MARK: &str = "/releases/tag/";
+    let mut from = 0;
+    while let Some(at) = html[from..].find(MARK) {
+        let start = from + at + MARK.len();
+        let tag: String = html[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+            .collect();
+        let version_like = tag.len() > 1
+            && tag.starts_with('v')
+            && tag[1..].chars().all(|c| c.is_ascii_digit() || c == '.');
+        if version_like {
+            return Some(tag);
+        }
+        from = start;
+    }
+    None
 }
 
 fn fetch() -> Result<String, String> {
