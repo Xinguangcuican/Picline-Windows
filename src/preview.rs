@@ -153,6 +153,7 @@ pub fn show(shot: &Shot, index: usize, count: usize) {
 /// A shot of our own: the preview outlives the call that opened it.
 fn copy(shot: &Shot) -> Shot {
     Shot {
+        drag_file: None,
         width: shot.width,
         height: shot.height,
         pixels: shot.pixels.clone(),
