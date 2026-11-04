@@ -6,7 +6,7 @@ Mac 端在 [`Xinguangcuican/Picline`](https://github.com/Xinguangcuican/Picline)
 
 > 主仓库 `Picline` 里的 `windows/` 目录是**本仓库的镜像**，方便在一处看两端。改动以本仓库为准，改完再同步过去。
 >
-> exe 在 [`Picline` 的 Releases](https://github.com/Xinguangcuican/Picline/releases/latest) 里下载（和 Mac 版放在同一页）。
+> exe 在本仓库的 [Releases](https://github.com/Xinguangcuican/Picline-Windows/releases/latest) 里下载；主仓 [`Picline`](https://github.com/Xinguangcuican/Picline/releases/latest) 也放了一份，方便和 Mac 版一起找。
 
 ## 版本号怎么数
 
