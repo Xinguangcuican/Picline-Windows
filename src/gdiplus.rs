@@ -80,6 +80,7 @@ extern "system" {
     fn GdipDeletePen(pen: *mut c_void) -> i32;
     fn GdipSetPenStartCap(pen: *mut c_void, cap: i32) -> i32;
     fn GdipSetPenEndCap(pen: *mut c_void, cap: i32) -> i32;
+    fn GdipSetPenDashStyle(pen: *mut c_void, dash: i32) -> i32;
     fn GdipDrawPath(graphics: *mut c_void, pen: *mut c_void, path: *mut c_void) -> i32;
     fn GdipCreateSolidFill(color: u32, brush: *mut *mut c_void) -> i32;
     fn GdipDeleteBrush(brush: *mut c_void) -> i32;
@@ -295,6 +296,40 @@ impl Painter {
 
             let mut pen: *mut c_void = std::ptr::null_mut();
             if GdipCreatePen1(argb, width, UNIT_PIXEL, &mut pen) == 0 {
+                let _ = GdipDrawPath(self.graphics, pen, path);
+                let _ = GdipDeletePen(pen);
+            }
+            let _ = GdipDeletePath(path);
+        }
+    }
+
+    /// The same edge, dashed: where a dropped picture is going to land.
+    pub fn dashed_outline(&self, x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, argb: u32) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+        unsafe {
+            let mut path: *mut c_void = std::ptr::null_mut();
+            if GdipCreatePath(0, &mut path) != 0 {
+                return;
+            }
+            if r <= 0.5 {
+                let _ = GdipAddPathRectangle(path, x, y, w, h);
+            } else {
+                let d = r * 2.0;
+                let _ = GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+                let _ = GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
+                let _ = GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
+                let _ = GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
+            }
+            let _ = GdipClosePathFigure(path);
+
+            let mut pen: *mut c_void = std::ptr::null_mut();
+            if GdipCreatePen1(argb, width, UNIT_PIXEL, &mut pen) == 0 {
+                // DashStyle 1 is `Dash`; the default solid pen would read as a
+                // fifth card sitting on the line.
+                let _ = GdipSetPenDashStyle(pen, 1);
                 let _ = GdipDrawPath(self.graphics, pen, path);
                 let _ = GdipDeletePen(pen);
             }

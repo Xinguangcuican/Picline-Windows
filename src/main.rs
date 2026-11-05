@@ -21,6 +21,7 @@
 mod canvas;
 mod clipboard;
 mod drag;
+mod dropin;
 mod gdiplus;
 mod hotkey;
 mod settings;
@@ -53,11 +54,11 @@ use windows::Win32::UI::HiDpi::{
     MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
-    VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetAsyncKeyState, GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, MOD_ALT,
+    MOD_CONTROL, MOD_SHIFT, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    ShellExecuteW, Shell_NotifyIconW, HDROP, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, QUNS_BUSY,
     QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
 };
@@ -141,6 +142,18 @@ fn tray_icon(instance: HINSTANCE, empty: bool) -> HICON {
 }
 /// How close to the top counts as touching it.
 const BAND: i32 = 3;
+/// How far below the top edge a picture on its way in brings the line down.
+/// Two menu bars' worth on the Mac; Windows has no menu bar to measure, so it
+/// is a fixed 56 logical pixels — near enough that ordinary work at the top of
+/// the screen does not keep calling the line out.
+const CATCH_BAND: i32 = 56;
+/// How long the button has to stay down before a press counts as carrying a
+/// picture. A click is shorter than this.
+const HOLD_TO_CARRY: Duration = Duration::from_millis(250);
+/// How far the pointer has to travel while the button is down. Dragging a
+/// picture across the screen clears this without anyone trying; a finger
+/// resting on the edge does not.
+const CARRY_TRAVEL: f32 = 5.0;
 /// Resting this long against the edge brings the line down. Long enough that a
 /// quick trip to a maximised window's buttons does not.
 const REVEAL_DELAY: Duration = Duration::from_millis(90);
@@ -386,6 +399,16 @@ struct App {
     /// A drag is running: the strip holds still and lets the mouse through
     /// while the picture is carried somewhere else.
     dragging: bool,
+    /// When the left button went down, and how far the pointer has travelled
+    /// since. A press that never moves is not a drag: resting a finger on the
+    /// top edge should not bring a bare line down.
+    carry_since: Option<Instant>,
+    carry_travel: f32,
+    carry_from: Option<POINT>,
+    /// A picture is being carried over the strip right now, so the window has
+    /// to keep taking the mouse: the shell will not drop onto a click-through
+    /// window.
+    drop_in_flight: bool,
 }
 
 impl App {
@@ -429,6 +452,10 @@ impl App {
             anchor: None,
             pending_collapse: None,
             dragging: false,
+            carry_since: None,
+            carry_travel: 0.0,
+            carry_from: None,
+            drop_in_flight: false,
         }
     }
 
@@ -572,8 +599,45 @@ impl App {
                         if n == 0 { argb(240, 255, 255, 255) } else { argb(190, 235, 235, 235) },
                     );
                 }
+                if self.drop_in_flight {
+                    // Where the picture being carried will land once it is
+                    // let go, drawn as the card it is about to become.
+                    let w = 132.0 * scale;
+                    let h = 104.0 * scale;
+                    let y = middle + 34.0 * scale - h / 2.0;
+                    painter.dashed_outline(
+                        width / 2.0 - w / 2.0,
+                        y,
+                        w,
+                        h,
+                        8.0 * scale,
+                        1.5 * scale,
+                        argb(220, 120, 180, 255),
+                    );
+                }
             } else {
                 let cards = self.card_layout(width, middle, scale);
+                if self.drop_in_flight {
+                    // Just past the last card, where the next one would go.
+                    let w = 132.0 * scale;
+                    let h = 104.0 * scale;
+                    let (x, y) = match cards.last() {
+                        Some(card) if card.x + card.w + 16.0 * scale + w <= width - 24.0 * scale => {
+                            (card.x + card.w + 16.0 * scale, card.y)
+                        }
+                        Some(card) => (card.x - 16.0 * scale - w, card.y),
+                        None => (width / 2.0 - w / 2.0, middle + 34.0 * scale - h / 2.0),
+                    };
+                    painter.dashed_outline(
+                        x,
+                        y,
+                        w,
+                        h,
+                        8.0 * scale,
+                        1.5 * scale,
+                        argb(220, 120, 180, 255),
+                    );
+                }
                 for card in &cards {
                     let shot = &self.shots[card.shot];
                     let center = card.x + card.w / 2.0;
@@ -925,12 +989,15 @@ impl App {
         if self.dragging {
             return;
         }
-        if self.hover == hover {
+        // A drag coming in is the other way round: there the strip has to keep
+        // the mouse, or the shell has nowhere to drop.
+        let catching = hover.is_some() || self.drop_in_flight;
+        if self.hover == hover && self.catching == catching {
             return;
         }
         self.hover = hover;
         self.refresh();
-        self.set_catching(hover.is_some());
+        self.set_catching(catching);
     }
 
     /// Turns a press that has moved far enough into a drag of that card. The
@@ -1545,6 +1612,14 @@ impl App {
         }
     }
 
+    /// Pictures the shell handed over because they were dropped on the strip.
+    fn dropped(&mut self, paths: Vec<PathBuf>) {
+        // The drag is over, so the strip can go back to being click-through.
+        self.drop_in_flight = false;
+        self.set_catching(false);
+        self.add_files(&paths);
+    }
+
     /// Shared tail end of anything that brings pictures in: cap the row,
     /// refresh the tray text, and show the line for a moment.
     fn accepted(&mut self) {
@@ -1588,23 +1663,73 @@ impl App {
         }
         let rc = info.rcMonitor;
 
+        // A press only counts as carrying something once it has been held and
+        // has moved. Resting a finger on the edge, or clicking a menu, is a
+        // press too and must not bring the line down.
+        let button = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
+        if button {
+            match self.carry_from {
+                None => {
+                    self.carry_since = Some(now);
+                    self.carry_travel = 0.0;
+                    self.carry_from = Some(cursor);
+                }
+                Some(last) => {
+                    let dx = (cursor.x - last.x) as f32;
+                    let dy = (cursor.y - last.y) as f32;
+                    self.carry_travel += (dx * dx + dy * dy).sqrt();
+                    self.carry_from = Some(cursor);
+                }
+            }
+        } else {
+            self.carry_since = None;
+            self.carry_travel = 0.0;
+            self.carry_from = None;
+        }
+        let carrying = self.carry_since.is_some_and(|since| {
+            now.duration_since(since) >= HOLD_TO_CARRY
+                && self.carry_travel >= CARRY_TRAVEL * self.scale
+        });
+
+        let catch_band = (CATCH_BAND as f32 * self.scale) as i32;
         let against_edge = cursor.x >= rc.left
             && cursor.x < rc.right
             && cursor.y >= rc.top
             && cursor.y < rc.top + BAND;
+        // A picture on its way in reaches the strip well before the very top
+        // edge, so the pointer does not have to be pushed to the last pixel.
+        let in_catch = cursor.x >= rc.left
+            && cursor.x < rc.right
+            && cursor.y >= rc.top
+            && cursor.y < rc.top + catch_band;
+        let was_in_flight = self.drop_in_flight;
+        self.drop_in_flight = carrying && in_catch;
+        if was_in_flight != self.drop_in_flight {
+            self.refresh();
+        }
+        // An empty line was only ever reaching out for a picture, so the strip
+        // that called it down is the whole of its zone.
         let on_the_line = cursor.x >= self.monitor.left
             && cursor.x < self.monitor.right
-            && cursor.y >= self.monitor.top
-            && cursor.y < self.monitor.top + self.height() + ZONE_SLACK;
+            && if self.shots.is_empty() {
+                cursor.y >= self.monitor.top && cursor.y < self.monitor.top + catch_band
+            } else {
+                cursor.y >= self.monitor.top
+                    && cursor.y < self.monitor.top + self.height() + ZONE_SLACK
+            };
 
         // Coming down: rest against the top edge long enough, and not while a
         // full screen app owns that screen.
         if self.target < 1.0 {
             // An empty line stays away: reaching for the top edge to get at
             // another window should not bring a bare rope down every time.
-            // The hot key and the tray still open it.
+            // The hot key and the tray still open it. A picture being carried
+            // in is the exception, and it is what makes dragging in work.
             let has_pictures = !self.shots.is_empty();
-            if against_edge && has_pictures && !fullscreen_busy() && self.reveal_key.held() {
+            let dragged_in = carrying && in_catch && !fullscreen_busy();
+            if (against_edge && has_pictures && !fullscreen_busy() && self.reveal_key.held())
+                || dragged_in
+            {
                 let since = *self.hot_since.get_or_insert(now);
                 if now.duration_since(since) >= REVEAL_DELAY {
                     self.hot_since = None;
@@ -1613,6 +1738,12 @@ impl App {
                     self.away_since = None;
                     self.pinned = false;
                     self.peek_until = None;
+                    if dragged_in {
+                        // The shell skips a click-through window when looking
+                        // for somewhere to drop, so the strip has to take the
+                        // mouse for as long as a picture is overhead.
+                        self.set_catching(true);
+                    }
                 }
             } else {
                 self.hot_since = None;
@@ -1626,6 +1757,12 @@ impl App {
                 // Once you have come to the line, it answers to the pointer
                 // again, so a pinned line still tucks itself away afterwards.
                 self.pinned = false;
+            } else if self.shots.is_empty() && !carrying && !self.pinned {
+                // Nothing hanging and nothing being carried: there is nothing
+                // to wait for, so it goes on the same tick instead of hovering
+                // over whatever is underneath for another half second.
+                self.away_since = None;
+                self.retract_to_zero();
             } else {
                 let since = *self.away_since.get_or_insert(now);
                 if !self.pinned && now.duration_since(since) >= RETRACT_DELAY {
@@ -2054,6 +2191,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
+            WM_DROPFILES => {
+                let handle = HDROP(wparam.0 as *mut std::ffi::c_void);
+                let paths = dropin::paths(handle);
+                dropin::finish(handle);
+                if paths.is_empty() {
+                    clipboard::trace("drop: no files in the list");
+                } else {
+                    clipboard::trace(&format!("drop of {} file(s)", paths.len()));
+                    app.dropped(paths);
+                }
+                return LRESULT(0);
+            }
             WM_CLIPBOARDUPDATE => {
                 // Noting it now and reading it a moment later avoids the
                 // classic race with the app that has just locked the board.
@@ -2298,6 +2447,9 @@ fn main() {
         ) else {
             return;
         };
+
+        // The shell needs to be told before the first drop can arrive.
+        dropin::accept(hwnd);
 
         let app = Box::into_raw(Box::new(App::new(hwnd)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
