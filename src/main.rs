@@ -298,6 +298,7 @@ impl RevealKey {
 }
 
 /// One card on the line, in logical pixels of the strip.
+#[derive(Clone, Copy)]
 struct Card {
     x: f32,
     y: f32,
@@ -414,6 +415,15 @@ struct App {
     /// to keep taking the mouse: the shell will not drop onto a click-through
     /// window.
     drop_in_flight: bool,
+    /// A card being carried sideways along the line: which picture, and where
+    /// the pointer is so it can follow it. A press that stays over the strip
+    /// rearranges the cards; one that leaves it hands the files to another
+    /// app.
+    sorting: Option<(usize, f32)>,
+    /// The order before the carry started, by fingerprint, so leaving the
+    /// strip can put it back: taking a picture away should not shuffle the
+    /// ones left behind.
+    sort_order: Option<Vec<u64>>,
 }
 
 impl App {
@@ -461,6 +471,8 @@ impl App {
             carry_travel: 0.0,
             carry_from: None,
             drop_in_flight: false,
+            sorting: None,
+            sort_order: None,
         }
     }
 
@@ -622,6 +634,16 @@ impl App {
                 }
             } else {
                 let cards = self.card_layout(width, middle, scale);
+                // A card being carried along the line follows the pointer and
+                // is drawn last, so it passes over the ones making room.
+                let mut drawn = cards.clone();
+                if let Some((shot, px)) = self.sorting {
+                    if let Some(pos) = drawn.iter().position(|card| card.shot == shot) {
+                        let mut card = drawn.remove(pos);
+                        card.x = px - card.w / 2.0;
+                        drawn.push(card);
+                    }
+                }
                 if self.drop_in_flight {
                     // Just past the last card, where the next one would go.
                     let w = 132.0 * scale;
@@ -643,7 +665,7 @@ impl App {
                         argb(220, 120, 180, 255),
                     );
                 }
-                for card in &cards {
+                for card in &drawn {
                     let shot = &self.shots[card.shot];
                     let center = card.x + card.w / 2.0;
                     // Where the rope actually is above this card: the curve
@@ -1007,7 +1029,9 @@ impl App {
 
     /// Turns a press that has moved far enough into a drag of that card. The
     /// strip gives the mouse back first, so the picture can be dropped on
-    /// whatever is behind the line instead of on the line itself.
+    /// whatever is behind the line instead of on the line itself. While the
+    /// pointer is still over the strip, the same press does something else:
+    /// it carries the card along the line and changes the order.
     fn maybe_drag(&mut self) {
         let (Some(index), Some(from)) = (self.press_shot, self.press_from) else {
             return;
@@ -1020,6 +1044,15 @@ impl App {
         if (now.x - from.x).abs() < slop && (now.y - from.y).abs() < slop {
             return;
         }
+
+        if self.over_strip(now) {
+            self.sort_along(index, now);
+            return;
+        }
+
+        // Left the line: whatever the carry had rearranged goes back, and the
+        // files are handed over to be dropped somewhere else.
+        self.end_sort(false);
 
         // Worked out before anything moves: the group is what is picked out.
         let indices = self.targets(index);
@@ -1062,6 +1095,136 @@ impl App {
 
         self.set_hover(None);
         self.refresh();
+    }
+
+    /// Whether that screen point is still over the strip. A small margin
+    /// keeps a pointer brushing the edge from flicking between "move the
+    /// card" and "take the file away".
+    fn over_strip(&self, point: POINT) -> bool {
+        let Some(canvas) = self.canvas.as_ref() else {
+            return false;
+        };
+        let margin = 24.0 * self.scale;
+        let x = (point.x - self.origin.0) as f32;
+        let y = (point.y - self.origin.1) as f32;
+        x >= -margin
+            && x <= canvas.width as f32 + margin
+            && y >= -margin
+            && y <= canvas.height as f32 + margin
+    }
+
+    /// Carries a card along the line: the others close up behind it, and it
+    /// stays under the pointer. Everything picked out travels as one block.
+    fn sort_along(&mut self, index: usize, point: POINT) {
+        let x = (point.x - self.origin.0) as f32;
+        // Pictures move under their own index, so remember which one is being
+        // carried and find it again once the order has changed.
+        let carried = self.shots.get(index).map(|shot| shot.hash);
+        let moved_pointer = self
+            .sorting
+            .map(|(_, last)| (last - x).abs() >= 0.5)
+            .unwrap_or(true);
+        if self.sorting.is_none() {
+            self.sort_order = Some(self.shots.iter().map(|shot| shot.hash).collect());
+        }
+        self.sorting = Some((index, x));
+        self.hover = None;
+
+        let moving = self.targets(index);
+        if moving.is_empty() {
+            return;
+        }
+        let (Some(first), Some(last)) = (
+            self.cards.first().map(|card| card.shot),
+            self.cards.last().map(|card| card.shot),
+        ) else {
+            return;
+        };
+        let start = first;
+        let end = last + 1;
+        if index < start || index >= end {
+            return;
+        }
+
+        // The block goes before the first card whose centre the pointer has
+        // not yet passed.
+        let mut slot = end;
+        for card in &self.cards {
+            if x < card.x + card.w / 2.0 {
+                slot = card.shot;
+                break;
+            }
+        }
+        // The slot counts cards on screen, so take out the ones that are
+        // moving before working out where the block goes among the rest.
+        let mut insert_at = 0;
+        for at in start..slot.max(start) {
+            if !moving.contains(&at) {
+                insert_at += 1;
+            }
+        }
+
+        let hashes: Vec<u64> = (start..end).map(|at| self.shots[at].hash).collect();
+        let rest: Vec<usize> = (start..end).filter(|at| !moving.contains(at)).collect();
+        let mut order: Vec<usize> = Vec::with_capacity(end - start);
+        order.extend_from_slice(&rest[..insert_at.min(rest.len())]);
+        order.extend(moving.iter().copied().filter(|at| *at >= start && *at < end));
+        order.extend_from_slice(&rest[insert_at.min(rest.len())..]);
+
+        // Same order as it already was: the picture still moves with the
+        // pointer, so the frame is only worth drawing if it has.
+        if order.iter().copied().eq(start..end) {
+            if moved_pointer {
+                self.refresh();
+            }
+            return;
+        }
+
+        let mut block: Vec<clipboard::Shot> = self.shots.drain(start..end).collect();
+        let mut ordered: Vec<clipboard::Shot> = Vec::with_capacity(end - start);
+        for at in &order {
+            let hash = hashes[at - start];
+            if let Some(pos) = block.iter().position(|shot| shot.hash == hash) {
+                ordered.push(block.remove(pos));
+            }
+        }
+        ordered.extend(block);
+        for (n, shot) in ordered.into_iter().enumerate() {
+            self.shots.insert(start + n, shot);
+        }
+        // The card that is being carried has moved with the others, so the
+        // press has to follow it or the next frame would carry its neighbour.
+        if let Some(hash) = carried {
+            if let Some(pos) = self.shots.iter().position(|shot| shot.hash == hash) {
+                self.press_shot = Some(pos);
+                self.sorting = Some((pos, x));
+            }
+        }
+        self.refresh();
+    }
+
+    /// The button came up, or the pointer left the line. `keeping` is false
+    /// when the drag went on to carry the files somewhere else, in which case
+    /// the order goes back to what it was.
+    fn end_sort(&mut self, keeping: bool) {
+        if self.sorting.take().is_none() {
+            self.sort_order = None;
+            return;
+        }
+        if !keeping {
+            if let Some(order) = self.sort_order.take() {
+                let mut restored: Vec<clipboard::Shot> = Vec::with_capacity(self.shots.len());
+                for hash in order {
+                    if let Some(pos) = self.shots.iter().position(|shot| shot.hash == hash) {
+                        restored.push(self.shots.remove(pos));
+                    }
+                }
+                restored.append(&mut self.shots);
+                self.shots = restored;
+                self.refresh();
+            }
+        }
+        self.sort_order = None;
     }
 
     /// A strip that is always in the way would be a nuisance: it only catches
@@ -2328,9 +2491,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     app.pressed = false;
                     app.press_shot = None;
                     app.press_from = None;
+                    // Carrying a card along the line counts as a drag, so the
+                    // group that was picked out stays picked out.
+                    let moved = app.sorting.is_some();
+                    app.end_sort(true);
                     // Letting go only settles the pick; the picture opens on a
                     // double click, as it does on the Mac.
-                    app.settle_selection(false);
+                    app.settle_selection(moved);
                 }
                 return LRESULT(0);
             }
