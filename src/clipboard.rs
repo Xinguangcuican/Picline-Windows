@@ -306,7 +306,14 @@ pub fn shot_from_path(path: &std::path::Path) -> Option<Shot> {
 /// its copy now, but a crash or a kill can leave one behind, and the old
 /// builds left one per drag. A week is longer than any of these is useful.
 pub fn sweep_leftovers() {
-    let root = std::env::temp_dir().join("Picline");
+    // Only the default folder is ours to empty. Once the user has pointed the
+    // folder somewhere else, that place holds their own files too, and a week
+    // old picture there is still theirs.
+    let root = if crate::storage::chosen().is_some() {
+        return;
+    } else {
+        crate::storage::default_folder()
+    };
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
@@ -692,7 +699,7 @@ pub fn ensure_file(shot: &Shot) -> Option<PathBuf> {
             return Some(path.clone());
         }
     }
-    let folder = std::env::temp_dir().join("Picline");
+    let folder = crate::storage::folder();
     std::fs::create_dir_all(&folder).ok()?;
     let path = folder.join(format!("picline-{:016x}.png", shot.hash));
     if path.is_file() {
@@ -722,7 +729,7 @@ pub fn ensure_drag_file(shot: &mut Shot) -> Option<PathBuf> {
             return Some(cached.clone());
         }
     }
-    let folder = std::env::temp_dir().join("Picline").join("drag");
+    let folder = crate::storage::folder().join("drag");
     std::fs::create_dir_all(&folder).ok()?;
     let base = format!("Picline {}", timestamp());
     let mut path = folder.join(format!("{base}.png"));

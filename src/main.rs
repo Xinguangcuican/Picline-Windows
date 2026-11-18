@@ -30,6 +30,7 @@ mod update;
 mod wic;
 mod preview;
 mod shellmenu;
+mod storage;
 
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -190,6 +191,10 @@ const MENU_REVEAL_SHIFT: usize = 13;
 const MENU_HOTKEY: usize = 5;
 const MENU_STARTUP: usize = 6;
 const MENU_UPDATE: usize = 7;
+// The storage submenu. Kept clear of 10–13, which the reveal-key radios use.
+const MENU_STORAGE_DEFAULT: usize = 20;
+const MENU_STORAGE_PICK: usize = 21;
+const MENU_STORAGE_OPEN: usize = 22;
 /// The per card menu. Numbers start well above the tray's so the two can
 /// never be confused.
 const CARD_PREVIEW: usize = 101;
@@ -1321,8 +1326,7 @@ impl App {
             files.push(path.clone());
         }
         if shot.path.is_none() {
-            let cache = std::env::temp_dir()
-                .join("Picline")
+            let cache = crate::storage::folder()
                 .join(format!("picline-{:016x}.png", shot.hash));
             if cache.is_file() {
                 files.push(cache);
@@ -2001,6 +2005,21 @@ impl App {
             MF_STRING
         };
         let _ = AppendMenuW(menu, shell, MENU_SHELL, w!("资源管理器右键「挂到 Picline」"));
+        // Where new pictures go. The default is a temp folder, which Windows
+        // may clear; this points it at a folder the user owns instead.
+        if let Ok(items) = CreatePopupMenu() {
+            let state = if crate::storage::chosen().is_some() {
+                MF_STRING
+            } else {
+                MF_STRING | MF_CHECKED
+            };
+            let _ = AppendMenuW(items, state, MENU_STORAGE_DEFAULT, w!("默认位置（临时文件夹）"));
+            let _ = AppendMenuW(items, MF_STRING, MENU_STORAGE_PICK, w!("选择文件夹…"));
+            let _ = AppendMenuW(items, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(items, MF_STRING, MENU_STORAGE_OPEN, w!("打开当前文件夹"));
+            let label = wide("图片保存位置");
+            let _ = AppendMenuW(menu, MF_POPUP, items.0 as usize, PCWSTR(label.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Launch at login: one registry value, ticked or not.
         let startup_flag = if startup::enabled() {
@@ -2102,6 +2121,40 @@ fn menu_owner(instance: HINSTANCE) -> HWND {
 /// A NUL-terminated UTF-16 copy, for the Win32 calls that take a pointer.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Asks the shell for a folder. `SHBrowseForFolderW` rather than the newer
+/// `IFileDialog`: one call, no COM object to marshal, and it is the same tree
+/// the user already knows from Explorer.
+unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
+
+    let title = wide("选择图片保存位置");
+    let mut display = [0u16; 260];
+    let info = BROWSEINFOW {
+        hwndOwner: owner,
+        pszDisplayName: windows::core::PWSTR(display.as_mut_ptr()),
+        lpszTitle: PCWSTR(title.as_ptr()),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..Default::default()
+    };
+    let id = SHBrowseForFolderW(&info);
+    if id.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 260];
+    let ok = SHGetPathFromIDListW(id, &mut buffer).as_bool();
+    // The shell hands out the item list; it is ours to free.
+    CoTaskMemFree(Some(id as *const std::ffi::c_void));
+    if !ok {
+        return None;
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])))
 }
 
 /// A full screen app, or presentation mode: leave that screen alone.
@@ -2352,6 +2405,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     MENU_TOGGLE => app.toggle(),
                     MENU_CLEAR => app.take_everything_down(),
                     MENU_SHELL => app.toggle_shell_menu(),
+                    MENU_STORAGE_DEFAULT => crate::storage::remember(None),
+                    MENU_STORAGE_PICK => {
+                        if let Some(path) = pick_folder(hwnd) {
+                            if crate::storage::is_usable(&path) {
+                                crate::storage::remember(Some(&path));
+                            } else {
+                                let text = wide("这个文件夹写不进去，请换一个。");
+                                let title = wide("图片保存位置");
+                                let _ = MessageBoxW(
+                                    hwnd,
+                                    PCWSTR(text.as_ptr()),
+                                    PCWSTR(title.as_ptr()),
+                                    MB_OK | MB_ICONWARNING,
+                                );
+                            }
+                        }
+                    }
+                    MENU_STORAGE_OPEN => {
+                        let folder = crate::storage::folder();
+                        let _ = std::fs::create_dir_all(&folder);
+                        let verb = wide("open");
+                        let path = wide(&folder.display().to_string());
+                        ShellExecuteW(
+                            hwnd,
+                            PCWSTR(verb.as_ptr()),
+                            PCWSTR(path.as_ptr()),
+                            PCWSTR::null(),
+                            PCWSTR::null(),
+                            SW_SHOWNORMAL,
+                        );
+                    }
                     MENU_HOTKEY => hotkey::record(hwnd),
                     MENU_STARTUP => {
                         let wanted = !startup::enabled();

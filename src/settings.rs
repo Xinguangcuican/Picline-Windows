@@ -41,6 +41,16 @@ pub fn set(key: &str, value: &str) {
         Some(slot) => slot.1 = value.to_string(),
         None => pairs.push((key.to_string(), value.to_string())),
     }
+    write(pairs);
+}
+
+/// Forgets a choice, so the default applies again.
+pub fn remove(key: &str) {
+    let pairs: Vec<(String, String)> = load().into_iter().filter(|(name, _)| name != key).collect();
+    write(pairs);
+}
+
+fn write(pairs: Vec<(String, String)>) {
     let Some(path) = file() else { return };
     let mut text = String::new();
     for (name, value) in pairs {
